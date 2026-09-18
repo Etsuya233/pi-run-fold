@@ -1,0 +1,8 @@
+node_modules/
+dist/
+
+# Reference clones of Pi and pi-tool-display: throwaway shallow clones used to
+# read the code this design depends on. See reference/README.md for the pinned
+# commits and refresh steps.
+reference/pi/
+reference/pi-tool-display/
