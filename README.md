@@ -140,12 +140,16 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 | 画面上的情形 | 分类结果 |
 | --- | --- |
 | `[A1(toolUse), T1, T2, A2(stop)]` | 藏 A1/T1/T2，保留 A2 |
-| `[A1(toolUse), T1]`（工具正在跑） | 还没有回答，但 A1 在流式/工具在跑 → **整个 run 折叠**，摘要显示计时 |
-| `[A1(toolUse), T1(错误)]`（abort 之后） | 没有回答、也没有东西在跑 → **不折叠**，错误输出留给用户 |
+| `[A1(toolUse), T1]`（工具正在跑） | 还没有回答，但工具在跑 → **整个 run 折叠**，摘要显示计时 |
+| `[A1(toolUse), T1]`（工具已返回、下一条消息还没开始） | 没有东西 pending，但 agent 还在跑（`agent_start`→`agent_settled`）→ **保持折叠**，计时继续走 |
+| `[A1(toolUse), T1(错误)]`（abort 之后，`agent_settled` 已到） | 没有回答、run 也已结束 → **不折叠**，错误输出留给用户 |
 | `[A1(stop)]`（直接回答） | 没有可藏的东西 → 原生渲染，一行都不多 |
 | auto-retry：`[A1(error), A2(stop)]` | 失败的尝试跟着步骤一起折进去（想要的效果） |
 
 "abort 之后不折叠"是刻意的：那时工具行里的错误文本就是用户要的结果，折成一个空摘要等于藏了它。
+反过来说，“工具返回但下一条消息还没开始”这个空档必须靠 run 级状态判定：只看子组件的 pending
+标志时它和 abort 长得一模一样，会让 `F2` 在这一瞬失效、并在下一条消息开始流式时突然自己折上
+（`computeFoldLayout()` 的 `active` 参数由 `index.ts` 的 `agent_start` / `agent_settled` 维护）。
 
 ### 2.3 不变量
 
@@ -163,14 +167,17 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 
 ### 2.4 计时
 
-Pi 的流式事件（`message_start` / `message_end` / `agent_end`）打点，key 用
-`message.timestamp`（跨重渲染、跨恢复都稳定）；恢复会话时从 `sessionManager.getEntries()`
-的 `entry.timestamp` 反推完成时刻。计时只在 assistant 流式期间每秒 tick 一次（ticker 只在
-有未完成计时的时候存在）。
+`message_start` / `message_end` 给每条 assistant 消息打点（key 用 `message.timestamp`，
+跨重渲染、跨恢复都稳定），`agent_start` / `agent_settled` 界定整个 run；恢复会话时从
+`sessionManager.getEntries()` 的 `entry.timestamp` 反推完成时刻。
 
-run 的时长 = `最后一个 assistant 的完成时刻 − 第一个 assistant 的开始时刻`。语义上是
-"这个 run 里模型的活跃时间窗口"，不是秒表：工具执行期间它停在上一段消息的窗口上，下一段回答
-开始时才跳。展开状态不持久化，时长在 run 内是精确的。
+**ticker 跟着 run 走，不跟着消息走**：从 `agent_start` 到 `agent_end` / `agent_settled`
+每秒 tick 一次。只在 assistant 流式期间 tick 的话，工具执行（`message_end` 之后、下一条消息
+开始之前）整段是死的，摘要就停在上一段消息的时长上。
+
+run 的时长 = `第一个 assistant 的开始时刻 → run 结束`。run 还在飞时“结束”就是 `now`（所以工具
+时间计入、数字一直走），`agent_settled` 之后用最后一个 assistant 的完成时刻——两者连续，结算时
+不会跳变。展开状态不持久化。
 
 ### 2.5 一条没走的路（以及为什么）
 
@@ -297,8 +304,10 @@ folded + refresh() every frame   2.09 ms/frame     ← 最坏情况；实际每�
 
 ### 4.3 测试
 
-13 个测试覆盖：run 分组与边界、live/settled run 的布局、摘要格式化与按宽截断、prototype
-包装与还原、外来补丁后的自愈、abort 后展开、transcript 重建、container 发现、扩展完整生命周期。
+18 个测试覆盖：run 分组与边界、live/settled/空档（tool 已返回但下一条消息未开始）的布局、
+run 级 ticker 与时长、摘要格式化与按宽截断、prototype 包装与还原、外来补丁后的自愈、abort
+后展开、transcript 重建、container 发现、offscreen 重绘（假 terminal + 真 `TuiMainScreen` +
+模拟 preserve-scrollback 状态）、扩展完整生命周期。
 测试用**真实的 Pi 组件**（`AssistantMessageComponent` / `ToolExecutionComponent` /
 `UserMessageComponent`）和假的 TUI/ctx 断言渲染出来的行。
 
@@ -307,8 +316,8 @@ folded + refresh() every frame   2.09 ms/frame     ← 最坏情况；实际每�
 | Pi 版本 | 怎么验的 | 结果 |
 | --- | --- | --- |
 | 0.83.0 | 还在 `pi-extensions` 工作区里时跑的全套单测 + headless 回放 | 通过 |
-| 0.84.4 | 本目录独立安装后跑 `bun run check` + headless 回放 | 13/13 通过 |
-| 0.85.1 | 临时 `bun add -d …@0.85.1` 后跑 `bun run lint` + 测试 | 13/13 通过 |
+| 0.84.4 | 本目录独立安装后跑 `bun run check` + headless 回放 | 18/18 通过 |
+| 0.85.1 | 修复前临时 `bun add -d …@0.85.1` 后跑 `bun run lint` + 测试 | 13/13 通过（本轮修复未在该版本复验） |
 | 任何版本 | `pi -e ~/programming/run-fold/index.ts --print "reply ok"` | 宿主加载成功（非 TUI 模式按设计不生效） |
 
 跨版本踩到的一个真实差异：**`TUI` 从 0.84 起不再由 `@earendil-works/pi-coding-agent`
@@ -329,13 +338,21 @@ bun install   # 回到 ^0.84.3
   transcript 里真出现"连续两条完整回答"（需要 steer / 树导航这类非典型顺序），前一条会被藏。
 - **chat container 的发现晚一帧。** `session_start` 时 transcript 是空的，`findChatContainer`
   要等桥接组件下一次 render 才成功；中间那一帧按原生渲染（此时本来也没内容可折）。
+  恢复会话时这意味着启动阶段那帧原生 transcript 需要靠 `/run-fold redraw`（或 fullscreen）才能
+  显示折叠后的样子（见下一条）。
 - **还没产出回答就被打断的 run 保留输出。** abort、或回答生成前被 steer 打断时，工具行与
   错误文本留给你看，不会折成一个空摘要。见 §2.2 决策四。
-- **时长是窗口不是秒表。** 见 §2.4。
-- **regular 模式会触发全屏重绘。** 把已经打印过的中间内容收起来会让 Pi 走 clear-on-shrink
-  （清屏 + `\x1b[3J` 清 scrollback + 重写整条 transcript，`tui-main-screen.ts:357,451`）。
-  每个中间步骤最多一次；"边跑边折"（工具还在跑时就折）通常不触发，因为那一帧总行数还在增长。
-  想要完全平滑请用 `--tui-mode fullscreen`（transcript 是 ScrollView，原地重排）。
+- **视口以上的轮次需要整屏重绘才能改。** regular 模式下已经打印过的行属于终端 scrollback，
+  Pi 只能走 clear-on-shrink（清屏 + `\x1b[3J` 清 scrollback + 重写整条 transcript，
+  `tui-main-screen.ts:357,451`）。于是：
+  - 没装 scrollback 保留类扩展时：折叠老轮次会触发一次整屏重绘（内容正确，代价是终端
+    scrollback 被清），这是 §2.2 决策一以来的固有性质。
+  - 装了 `awoaCrim/preserveScrollbackPatch`（或同类）时：它的 `maskOffscreenChanges()` 会把
+    "视口以上"的差异当成已渲染丢弃，`preserveScrollbackInOutput()` 又把整屏重绘改写成只重写
+    可见尾巴——**折叠老轮次根本到不了终端**，而 Pi 内部还认为已显示了。F2 会自动检测这种情况
+    并提示（退出：`/run-fold redraw`、`/run-fold repaint on`，或 `--tui-mode fullscreen`）。
+  - 完全平滑的做法始终是 `--tui-mode fullscreen`（transcript 是 ScrollView，原地重排，
+    且那个补丁在 fullscreen 下根本不安装）。
 - **只有 TUI 模式生效**（`--print` / `--mode json` / rpc 下什么都不做，也不该做）。
 - **`instanceof` 依赖 Pi 的模块别名。** 扩展里的 `@earendil-works/*` 由 Pi 的 jiti
   alias/virtualModules 注入（`loader.ts:121,517`），所以独立目录不需要运行时依赖、也保证

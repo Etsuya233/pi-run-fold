@@ -212,6 +212,7 @@ function assistantClassifications(
 function runTiming(
   run: readonly ClassifiedChild[],
   timings: TimingSource,
+  active: boolean,
 ): Pick<RunSummary, "durationMs" | "live"> {
   const assistants = assistantClassifications(run);
   const first = assistants[0];
@@ -219,8 +220,12 @@ function runTiming(
   if (!first || !last) return { live: false };
 
   const startedAt = timings.timingFor(first.timestamp)?.startedAt ?? first.timestamp;
-  const completedAt = timings.timingFor(last.timestamp)?.completedAt;
-  const live = completedAt === undefined;
+  // A run that is still in flight ends "now": tool execution and the gaps
+  // between messages belong to the run, and the number keeps moving instead of
+  // freezing on the last message that happened to finish. Once the run settles,
+  // the last message's completion is the end, so the value stays consistent.
+  const completedAt = active ? undefined : timings.timingFor(last.timestamp)?.completedAt;
+  const live = active || completedAt === undefined;
   const endedAt = completedAt ?? timings.now();
   if (startedAt === undefined || !Number.isFinite(startedAt) || !Number.isFinite(endedAt)) {
     return { live };
@@ -232,6 +237,7 @@ function summarizeRun(
   run: readonly ClassifiedChild[],
   hidden: readonly ClassifiedChild[],
   timings: TimingSource,
+  active: boolean,
 ): RunSummary {
   const toolNames: string[] = [];
   let thinkingRuns = 0;
@@ -244,7 +250,7 @@ function summarizeRun(
     toolCount: toolNames.length,
     thinkingRuns,
     toolNames,
-    ...runTiming(run, timings),
+    ...runTiming(run, timings, active),
   };
 }
 
@@ -253,6 +259,7 @@ function foldRun(
   layout: Map<Component, FoldEntry>,
   options: RunFoldOptions,
   timings: TimingSource,
+  active: boolean,
 ): void {
   let lastAnswer = -1;
   let anyPending = false;
@@ -264,12 +271,13 @@ function foldRun(
   });
 
   // Children before the run's answer are its intermediate steps. While a run is
-  // still working (a tool is running, or an answer is streaming) and no answer
-  // exists yet, every child is intermediate. A settled run without an answer
-  // (aborted or failed) keeps its content visible: that output is the result.
+  // still working (a tool is running, an answer is streaming, or the agent is
+  // between two messages of the same run) and no answer exists yet, every child
+  // is intermediate. A settled run without an answer (aborted or failed) keeps
+  // its content visible: that output is the result.
   let candidates: ClassifiedChild[];
   if (lastAnswer >= 0) candidates = run.slice(0, lastAnswer);
-  else if (anyPending) candidates = [...run];
+  else if (anyPending || active) candidates = [...run];
   else return;
 
   const hidden: ClassifiedChild[] = [];
@@ -282,7 +290,7 @@ function foldRun(
   }
   if (hidden.length === 0) return;
 
-  const summary = summarizeRun(run, hidden, timings);
+  const summary = summarizeRun(run, hidden, timings, active);
   hidden.forEach((entry, index) => {
     layout.set(entry.component, index === 0 ? { hidden: true, summary } : { hidden: true });
   });
@@ -292,19 +300,26 @@ function foldRun(
  * Decide, for every chat-container child, whether it is folded away and which
  * child renders the run summary. Recomputed from live children so restored
  * sessions, `/compact`, and `/tree` navigation need no extra bookkeeping.
+ *
+ * `active` says whether the agent is still working on the trailing run. Between
+ * a finished assistant message (with tool calls) and the next one, nothing in
+ * the transcript is pending, but the run is clearly not over: the flag keeps it
+ * folded and its clock live instead of falling back to native rendering.
  */
 export function computeFoldLayout(
   children: readonly Component[],
   options: RunFoldOptions,
   timings: TimingSource = NO_TIMINGS,
+  active = false,
 ): Map<Component, FoldEntry> {
   const layout = new Map<Component, FoldEntry>();
   if (options.expanded) return layout;
   if (!options.hideTools && !options.hideIntermediateText) return layout;
 
   let run: ClassifiedChild[] = [];
-  const flush = () => {
-    if (run.length > 0) foldRun(run, layout, options, timings);
+  // Only the trailing run can still be in flight; every earlier run is settled.
+  const flush = (runActive = false) => {
+    if (run.length > 0) foldRun(run, layout, options, timings, runActive);
     run = [];
   };
   for (const child of children) {
@@ -315,7 +330,7 @@ export function computeFoldLayout(
     }
     run.push({ component: child, classification });
   }
-  flush();
+  flush(active);
   return layout;
 }
 
@@ -383,6 +398,8 @@ export interface RunFoldPatchHandle {
   readonly expanded: boolean;
   readonly options: RunFoldOptions;
   setOptions(options: Partial<RunFoldOptions>): void;
+  /** Whether the agent is still working on the trailing run. */
+  setRunActive(active: boolean): void;
   setToggleKey(key: string): void;
   setTimingSource(timings: TimingSource): void;
   /** The chat container used for run grouping; undefined disables folding. */
@@ -398,6 +415,7 @@ interface PatchRecord {
   owners: number;
   options: RunFoldOptions;
   toggleKey: string;
+  runActive: boolean;
   timings: TimingSource;
   container?: Container;
   theme?: Theme;
@@ -439,7 +457,7 @@ function ensureLayout(record: PatchRecord): Map<Component, FoldEntry> {
   const last = children[children.length - 1];
   const key = `${record.revision}|${children.length}|${last ? componentId(last) : "none"}`;
   if (record.cache?.signature === key) return record.cache.layout;
-  const layout = computeFoldLayout(children, record.options, record.timings);
+  const layout = computeFoldLayout(children, record.options, record.timings, record.runActive);
   record.cache = { signature: key, layout };
   return layout;
 }
@@ -477,6 +495,7 @@ function createPatchRecord(options: Partial<RunFoldOptions>): PatchRecord {
     owners: 0,
     options: { ...DEFAULT_RUN_FOLD_OPTIONS, ...options },
     toggleKey: DEFAULT_RUN_FOLD_TOGGLE_KEY,
+    runActive: false,
     timings: NO_TIMINGS,
     revision: 0,
     baseAssistantRender: assistantPrototype.render,
@@ -566,6 +585,12 @@ export function installRunFoldPatch(
     },
     setToggleKey(key) {
       record.toggleKey = key.trim() || DEFAULT_RUN_FOLD_TOGGLE_KEY;
+      record.cache = undefined;
+    },
+    setRunActive(active) {
+      if (record.runActive === active) return;
+      record.runActive = active;
+      record.revision += 1;
       record.cache = undefined;
     },
     setTimingSource(timings) {
