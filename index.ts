@@ -341,20 +341,33 @@ export default function (pi: ExtensionAPI) {
           patch.toggle();
           afterFoldChange();
           break;
-        case "expand":
-          patch.setOptions({ expanded: true });
+        // The value aliases at the action level: `/run-fold collapse` says
+        // "fold it" and `/run-fold expand` says "show it natively".
+        case "collapse":
+          patch.setOptions({ folded: true });
           afterFoldChange();
           break;
-        case "collapse":
-          patch.setOptions({ expanded: false });
+        case "expand":
+          patch.setOptions({ folded: false });
+          afterFoldChange();
+          break;
+        case "fold":
+          patch.setOptions({ folded: parseToggle(value) });
           afterFoldChange();
           break;
         case "text":
-          patch.setOptions({ hideIntermediateText: value !== "off" && value !== "show" });
+        case "intermediateText":
+          patch.setOptions({ hideIntermediateText: parseToggle(value) });
           afterFoldChange();
           break;
-        case "tools":
-          patch.setOptions({ hideTools: value !== "off" && value !== "show" });
+        case "thinking":
+        case "think":
+          patch.setOptions({ hideThinking: parseToggle(value) });
+          afterFoldChange();
+          break;
+        case "tool":
+        case "toolcalls":
+          patch.setOptions({ hideToolCalls: parseToggle(value) });
           afterFoldChange();
           break;
         case "repaint":
@@ -369,7 +382,8 @@ export default function (pi: ExtensionAPI) {
           break;
         default:
           context.ui.notify(
-            "Usage: /run-fold [toggle|expand|collapse|text on|off|tools on|off|repaint on|off|redraw|status]",
+            "Usage: /run-fold [toggle|collapse|expand|fold|text|thinking|tool|repaint <on|off>|redraw|status] " +
+              "(aliases: intermediateText = text, think = thinking, toolcalls = tool; on = collapse, off = show = expand)",
             "warning",
           );
           return;
@@ -383,11 +397,21 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
+/**
+ * `on` folds or hides, `off` keeps or shows. `collapse` and `expand` say the
+ * same thing in the vocabulary of what happens on screen, and `show` is the
+ * historical spelling of `off`. No argument - or anything else - means on.
+ */
+function parseToggle(value: string | undefined): boolean {
+  return value !== "off" && value !== "show" && value !== "expand";
+}
+
 function describeOptions(options: RunFoldOptions): string {
   return [
-    options.expanded ? "expanded" : "folded",
+    options.folded ? "folded" : "expanded",
     `intermediate text ${options.hideIntermediateText ? "hidden" : "shown"}`,
-    `tools ${options.hideTools ? "hidden" : "shown"}`,
+    `thinking ${options.hideThinking ? "hidden" : "shown"}`,
+    `tool calls ${options.hideToolCalls ? "hidden" : "shown"}`,
     `${DEFAULT_RUN_FOLD_TOGGLE_KEY} toggles`,
   ].join(" · ");
 }
@@ -406,6 +430,7 @@ export {
   renderRunSummaryLines,
   type FoldClassification,
   type FoldEntry,
+  type FoldMask,
   type RunFoldOptions,
   type RunFoldPatchHandle,
   type RunSummary,

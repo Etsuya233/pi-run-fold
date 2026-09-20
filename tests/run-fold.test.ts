@@ -85,7 +85,9 @@ function timingsSource(map: Map<number, { startedAt: number; completedAt?: numbe
   };
 }
 
-const options: RunFoldOptions = { ...DEFAULT_RUN_FOLD_OPTIONS };
+// The fully-folded strategy: what the tests below describe when they say a run
+// "folds". The shipped default keeps intermediate text visible.
+const options: RunFoldOptions = { ...DEFAULT_RUN_FOLD_OPTIONS, hideIntermediateText: true };
 
 function plain(lines: string[]): string[] {
   return lines.map((line) => stripVTControlCharacters(line).trimEnd());
@@ -160,7 +162,7 @@ test("a settled answer folds its reasoning and an answerless run keeps its outpu
   const layout = computeFoldLayout(chat.children, options);
   const entry = layout.get(only);
   assert.equal(entry?.hidden, false, "the answer stays visible");
-  assert.equal(entry?.stripThinking, true, "its reasoning folds into the summary");
+  assert.deepEqual(entry?.mask, { thinking: true }, "its reasoning folds into the summary");
   assert.equal(entry?.summary?.thinkingRuns, 1);
   assert.equal(layout.get(trailingTool), undefined, "a plain trailing tool is a boundary, not part of the run");
 
@@ -210,7 +212,7 @@ test("a settled answer keeps its text and folds its reasoning into the summary",
   chat.addChild(toolComponent("t", "read", "file body"));
   chat.addChild(final);
 
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([
@@ -243,7 +245,7 @@ test("reasoning stays while it is the live tail and folds as soon as text arrive
   const answer = assistantComponent(assistant({ timestamp: T0 + 5_000, thinking: "正在推理" }));
   chat.addChild(answer);
 
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 1_000 }]])));
@@ -278,7 +280,7 @@ test("reasoning of a visible step folds without leaving a blank row behind", () 
   chat.addChild(step);
   chat.addChild(new ToolExecutionComponent("read", "t", {}, {}, undefined, ui, "/local/workspace"));
 
-  const patch = installRunFoldPatch({ ...options, expanded: false, hideIntermediateText: false });
+  const patch = installRunFoldPatch({ ...options, hideIntermediateText: false });
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
@@ -312,7 +314,7 @@ test("reasoning wrapped for mouse handling is masked the same way", () => {
   };
   chat.addChild(answer);
 
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
@@ -335,7 +337,7 @@ test("an unrecognized message layout falls back to native rendering", () => {
   content.children.push({ render: () => ["unexpected"], invalidate() {} });
   chat.addChild(answer);
 
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
@@ -348,7 +350,7 @@ test("an unrecognized message layout falls back to native rendering", () => {
   }
 });
 
-test("expanded runs and strategy switches change what is folded", () => {
+test("turning folding off, and keeping a kind of content, change what is folded", () => {
   const chat = new Container();
   const first = assistantComponent(assistant({ timestamp: T0, thinking: "a", text: "narration", tools: [{ id: "t", name: "read" }], stopReason: "toolUse" }));
   const final = assistantComponent(assistant({ timestamp: T0 + 1_000, text: "answer" }));
@@ -356,14 +358,14 @@ test("expanded runs and strategy switches change what is folded", () => {
   chat.addChild(toolComponent("t", "read", "…"));
   chat.addChild(final);
 
-  assert.equal(computeFoldLayout(chat.children, { ...options, expanded: true }).size, 0);
+  assert.equal(computeFoldLayout(chat.children, { ...options, folded: false }).size, 0);
 
   const toolsOnly = computeFoldLayout(chat.children, {
     ...options,
     hideIntermediateText: false,
   }, timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 1_000 }]])));
   assert.equal(toolsOnly.get(first)?.hidden, false, "narration stays visible");
-  assert.equal(toolsOnly.get(first)?.stripThinking, true, "its reasoning still folds");
+  assert.deepEqual(toolsOnly.get(first)?.mask, { thinking: true }, "its reasoning still folds");
   assert.equal(toolsOnly.size, 2, "the tool folds and hosts the summary");
   assert.deepEqual(toolsOnly.get(chat.children[1]!)?.summary, {
     toolCount: 1,
@@ -372,6 +374,107 @@ test("expanded runs and strategy switches change what is folded", () => {
     durationMs: 60_000,
     live: true,
   });
+});
+
+test("the shipped default keeps intermediate text and folds tools and thinking", () => {
+  const chat = new Container();
+  const step = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "hmm",
+      text: "narration",
+      tools: [{ id: "t", name: "read" }],
+      stopReason: "toolUse",
+    }),
+  );
+  const final = assistantComponent(assistant({ timestamp: T0 + 1_000, text: "answer" }));
+  chat.addChild(step);
+  chat.addChild(toolComponent("t", "read", "file body"));
+  chat.addChild(final);
+
+  const layout = computeFoldLayout(
+    chat.children,
+    DEFAULT_RUN_FOLD_OPTIONS,
+    timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 1_000 }]])),
+  );
+  assert.equal(layout.get(step)?.hidden, false, "the step stays: its text is not folded");
+  assert.deepEqual(layout.get(step)?.mask, { thinking: true }, "only its reasoning goes");
+  // The tool row is the first thing the fold takes away whole, so it hosts the
+  // summary; the narration above it is untouched.
+  assert.equal(layout.get(chat.children[1]!)?.hidden, true);
+  assert.deepEqual(layout.get(chat.children[1]!)?.summary, {
+    toolCount: 1,
+    thinkingRuns: 1,
+    toolNames: ["read"],
+    durationMs: 60_000,
+    live: true,
+  });
+  assert.equal(layout.get(final), undefined, "the answer renders natively");
+});
+
+test("keeping thinking while folding text leaves the reasoning in place", () => {
+  const chat = new Container();
+  const step = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "想一想",
+      text: "半截正文",
+      tools: [{ id: "t", name: "read" }],
+      stopReason: "toolUse",
+    }),
+  );
+  chat.addChild(step);
+  chat.addChild(toolComponent("t", "read", "file body"));
+  chat.addChild(assistantComponent(assistant({ timestamp: T0 + 1_000, text: "答案" })));
+
+  const patch = installRunFoldPatch({ hideIntermediateText: true, hideThinking: false });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
+  try {
+    const lines = plain(chat.render(70));
+    const rendered = lines.join("\n");
+    assert.match(rendered, /想一想/, "the reasoning survives");
+    assert.doesNotMatch(rendered, /半截正文/, "the step's text is masked");
+    assert.doesNotMatch(rendered, /file body/, "the tool row is still folded");
+    assert.match(rendered, /答案/, "the answer follows");
+    // The summary block leads with its own blank line; a masked text row that
+    // left one behind would put a second blank between it and the reasoning.
+    const reasoningAt = lines.findIndex((line) => /想一想/.test(line));
+    const summaryAt = lines.findIndex((line) => /▸ read/.test(line));
+    assert.equal(summaryAt - reasoningAt, 2, "no blank row is left where the text was");
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("masking text never takes the truncation note with it", () => {
+  const chat = new Container();
+  const step = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "想一想",
+      text: "半截正文",
+      tools: [{ id: "t", name: "read" }],
+      stopReason: "length",
+    }),
+  );
+  chat.addChild(step);
+  chat.addChild(toolComponent("t", "read", "file body"));
+  chat.addChild(assistantComponent(assistant({ timestamp: T0 + 1_000, text: "答案" })));
+
+  const patch = installRunFoldPatch({ hideIntermediateText: true, hideThinking: false });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
+  try {
+    const rendered = plain(chat.render(70)).join("\n");
+    assert.doesNotMatch(rendered, /半截正文/, "the step's text is masked");
+    assert.match(rendered, /想一想/, "its reasoning survives");
+    assert.match(rendered, /Response was truncated before completion/, "the result row is not content");
+  } finally {
+    patch.dispose();
+  }
 });
 
 test("custom cards stay inside a run and are never folded", () => {
@@ -452,7 +555,7 @@ test("the render patch folds live components and restores them on dispose", () =
   chat.addChild(final);
 
   const nativeLines = plain(chat.render(70)).filter(Boolean).length;
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([
@@ -466,7 +569,7 @@ test("the render patch folds live components and restores them on dispose", () =
     assert.doesNotMatch(folded.join("\n"), /narration|hello|world/);
     assert.match(folded.join("\n"), /final answer/);
 
-    patch.setOptions({ expanded: true });
+    patch.setOptions({ folded: false });
     const expanded = plain(chat.render(70)).filter(Boolean).length;
     assert.equal(expanded, nativeLines);
   } finally {
@@ -487,7 +590,7 @@ test("assertRunFoldPatch re-applies after another party restores the render", ()
   chat.addChild(final);
 
   const native = AssistantMessageComponent.prototype.render;
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   try {
@@ -594,7 +697,7 @@ test("an aborted run expands again so its error output stays visible", async () 
   const running = new ToolExecutionComponent("bash", "x", {}, {}, undefined, ui, "/local/workspace");
   chat.addChild(running);
 
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0 }]])));
@@ -627,6 +730,65 @@ test("findChatContainer locates the container that holds messages", () => {
 
   assert.equal(findChatContainer(root), chat);
   assert.equal(findChatContainer(new Container()), undefined);
+});
+
+test("/run-fold command and value aliases reach the same branch as their canonical names", async () => {
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => unknown }>();
+  const pi = {
+    on() {},
+    registerShortcut() {},
+    registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionContext) => unknown }) {
+      commands.set(name, command);
+    },
+  } as unknown as ExtensionAPI;
+
+  // The command echoes `describeOptions()` after every branch, so two runs that
+  // land on the same option state report the same text.
+  const notifications: string[] = [];
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      theme,
+      notify(message: string) {
+        notifications.push(message);
+      },
+    },
+    sessionManager: { getEntries: () => [] },
+  } as unknown as ExtensionContext;
+
+  runFoldExtension(pi);
+  const run = async (args: string) => {
+    notifications.length = 0;
+    await commands.get("run-fold")!.handler(args, ctx);
+    return notifications.at(-1);
+  };
+
+  assert.equal(await run("intermediateText on"), await run("text on"), "intermediateText is text");
+  assert.equal(await run("intermediateText off"), await run("text off"), "and off is off either way");
+  assert.equal(await run("toolcalls on"), await run("tool on"), "tool is toolcalls");
+  assert.equal(await run("toolcalls off"), await run("tool off"), "including with an argument");
+  assert.equal(await run("think on"), await run("thinking on"), "think is thinking");
+  assert.equal(await run("think expand"), await run("thinking expand"), "both spellings take the aliases");
+
+  // The values say the same thing from the other end: hiding is collapsing.
+  assert.equal(await run("text collapse"), await run("text on"));
+  assert.equal(await run("text expand"), await run("text off"));
+  assert.equal(await run("text show"), await run("text off"), "show still means off");
+  assert.equal(await run("thinking collapse"), await run("thinking on"));
+  assert.equal(await run("tool expand"), await run("tool off"));
+  assert.equal(await run("fold collapse"), await run("fold on"));
+  assert.equal(await run("fold expand"), await run("fold off"));
+  // The same two words also work as actions, with no sub-command in front.
+  assert.equal(await run("collapse"), await run("fold on"));
+  assert.equal(await run("expand"), await run("fold off"));
+
+  // Guard against the assertions above being vacuous.
+  assert.notEqual(await run("text on"), await run("text off"));
+  assert.notEqual(await run("tool on"), await run("tool off"));
+
+  const unknown = await run("tools on");
+  assert.match(unknown ?? "", /Usage: \/run-fold/, "the old plural name is not an alias");
 });
 
 test("the extension folds a live transcript, toggles with the shortcut, and cleans up", async () => {
@@ -699,9 +861,12 @@ test("the extension folds a live transcript, toggles with the shortcut, and clea
 
     await emit("message_start", { message: assistant({ timestamp: T0 + 12_000, text: "final answer" }) });
     const folded = plain(chat.render(70)).filter(Boolean);
-    assert.equal(folded.length, 2, "summary plus final answer");
-    assert.match(folded[0]!, /▸ read · \(f2 to expand\)|▸ read/);
-    assert.match(folded[1]!, /final answer/);
+    // The shipped default keeps intermediate text: the narration stays in place,
+    // the tool row folds and hosts the summary, and the answer follows it.
+    assert.equal(folded.length, 3, "narration, summary, final answer");
+    assert.match(folded[0]!, /narration/);
+    assert.match(folded[1]!, /▸ read/);
+    assert.match(folded[2]!, /final answer/);
 
     const before = renders;
     await shortcuts.get("f2")!.handler(ctx);
@@ -764,7 +929,7 @@ test("toggling in the tool-to-message gap folds immediately instead of waiting f
   chat.addChild(intermediate);
   chat.addChild(toolComponent("t", "read", "file body"));
 
-  const patch = installRunFoldPatch({ ...options, expanded: false });
+  const patch = installRunFoldPatch(options);
   patch.setContainer(chat);
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));

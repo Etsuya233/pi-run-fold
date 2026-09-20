@@ -1,10 +1,12 @@
 # pi-run-fold
 
-> Fold each agent run in Pi's TUI into one summary line. A run keeps its prompt
-> and its final answer; tool rows, tool output, intermediate assistant text, and
-> reasoning collapse into a single live line - while the run works, the newest
-> step (the running tool, the streaming text, or the reasoning being produced)
-> stays on screen as the live tail. `F2` expands everything again.
+> Fold each agent run in Pi's TUI into one summary line. A run keeps its prompt,
+> its intermediate text (by default), and its final answer; tool rows, tool
+> output, and reasoning collapse into that one line - while the run works, the
+> newest step (the running tool, the streaming text, or the reasoning being
+> produced) stays on screen as the live tail. Intermediate text, thinking, and
+> tool calls fold independently (`/run-fold text|thinking|tool on|off`), and
+> `F2` turns folding off entirely.
 > Display-only: no session entries, no message mutation, no model-context change.
 > *This document is written in Chinese because it is a design note; the extension
 > itself and its API are English.*
@@ -17,6 +19,8 @@
 ```text
 > 读一下 package.json 再看 tests 目录
 
+  让我先看看根目录。
+
   ▸ read · 1 thinking · 2.1s  (f2 to expand)
 
   测试入口是 bun test
@@ -27,13 +31,17 @@ run 结束后的样子：
 ```text
 > 读一下 package.json 再看 tests 目录
 
+  让我先看看 package.json。
+
   ▸ read · 2 thinking · 6.3s  (f2 to expand)
 
   这是 bun 工作区，测试入口是 bun run test。
 ```
 
-折叠前，同一份 transcript 是 40 行工具输出 + 3 段中间叙述；折叠后只剩上面 6 行。
-`F2` 展开回原生渲染，再按一次折回。
+默认（`hideIntermediateText: false`）连中间正文一起留在原地，只把工具行和思考折进摘要行，
+所以上面那句叙述在折叠后依然看得见。三类内容互不影响，`/run-fold text on` 是最紧的形态：
+折叠前同一份 transcript 是 40 行工具输出 + 3 段中间叙述，全折掉后只剩 6 行。
+`F2` 关掉折叠、回到原生渲染，再按一次折回。
 
 ---
 
@@ -52,15 +60,25 @@ pi remove  ~/programming/run-fold
 
 | 入口 | 作用 |
 | --- | --- |
-| `F2` | 全局展开 / 折叠 |
+| `F2` | 折叠总开关（关 = 原生渲染） |
 | `/run-fold` | 同上（toggle） |
-| `/run-fold expand` / `collapse` | 显式展开 / 折叠 |
-| `/run-fold text on\|off` | 保留 / 隐藏中间叙述 |
-| `/run-fold tools on\|off` | 保留 / 隐藏工具行 |
+| `/run-fold fold on\|off` | 同上，显式开关 |
+| `/run-fold collapse` / `expand` | 同上，不带子命令的动作写法（= `fold on` / `fold off`） |
+| `/run-fold text on\|off`（别名 `intermediateText`） | 隐藏 / 保留中间正文（默认**保留**） |
+| `/run-fold thinking on\|off`（别名 `think`） | 隐藏 / 保留思考（默认隐藏） |
+| `/run-fold tool on\|off`（别名 `toolcalls`） | 隐藏 / 保留工具调用行（默认隐藏） |
+| `/run-fold repaint on\|off` | 折叠涉及视口上方时整屏重绘 |
+| `/run-fold redraw` | 立刻整屏重绘一次 |
 | `/run-fold status` | 打印当前策略 |
 
-`/run-fold text off` 是"只有工具太吵"模式：中间叙述留下，工具行折成摘要那一行。
-两个模式都不显示中间步骤的思考：思考要么正在流式（实时尾部）、要么折进摘要的 `N thinking`。
+取值统一：`on` = `collapse`（折起 / 隐藏），`off` = `show` = `expand`（展开 / 保留）；
+不给值等于 `on`。所以 `/run-fold text collapse`、`/run-fold text on`、`/run-fold text` 是同一件事。
+
+默认就是"工具和思考太吵"模式：中间正文留在原地，工具行与思考折进摘要那一行
+（`▸ read · 2 thinking · 6.3s`）。三类内容各管各的：`/run-fold text on` 连正文一起折，
+`/run-fold thinking off` 把思考留在屏幕上（包括最终回答自己的思考），
+`/run-fold tool off` 让工具行留在原地。被折掉的思考只可能"正在流式（实时尾部）"或
+"计入摘要的 `N thinking`"，不会静默消失。
 
 **为什么是 `F2`**：`ctrl+o`（工具展开）和 `ctrl+t`（thinking 展开）在 Pi 的
 `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` 里，扩展注册会被拒绝并告警；
@@ -152,18 +170,22 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 | 思考了几次 | content 里**连续** thinking 块算 1 次 |
 | 用了哪些工具 | `component.toolName` |
 
-#### 决策三：摘要行由「该 run 第一个被隐藏的组件」渲染，而不是新插入一个组件
+#### 决策三：摘要行由「该 run 第一个被折掉的东西」渲染，而不是新插入一个组件
 
-因为第一个被隐藏的组件**本来就在摘要该在的位置上**（用户消息之后第一个中间步骤），它的高度变化
-由 Pi 的 `mouseLayout` 自动记账，点击区域也天然落在它身上（后续要做"点摘要展开"只需给这个
-实例挂 `handleMouse`）。
+因为第一个被折掉的东西——默认是第一条工具行，三类全折时是第一个中间步骤——**本来就在摘要该在
+的位置上**（用户消息之后第一个中间步骤），它的高度变化由 Pi 的 `mouseLayout` 自动记账，点击区域
+也天然落在它身上（后续要做"点摘要展开"只需给这个实例挂 `handleMouse`）。
 
-一个 run 里只有一个组件负责渲染摘要，其余返回 `[]`。展开状态下布局表为空，摘要随之消失——
-因为渲染它的组件自己也不再被隐藏。
+一个 run 里只有一个组件渲染摘要：被整条藏掉的第一个子节点；如果这个 run 没有任何东西被整条藏掉，
+就是第一条只被遮罩的步骤（摘要印在它上面）。关掉折叠时布局表为空，摘要随之消失——因为渲染它的
+组件自己也不再被隐藏。
 
 #### 决策四：实时尾部 + 「最终回答」
 
-两条规则叠加，覆盖所有实际形态：
+两条规则叠加，覆盖所有实际形态。下表按**三类内容全都折**
+（`hideIntermediateText: true, hideThinking: true, hideToolCalls: true`）描述，也就是
+`/run-fold text on` 的最紧形态；默认只折思考与工具调用，中间正文留在原地（上面的"藏"相应地
+只是"遮掉那条消息的正文/思考"，消息本身还在）。
 
 | 画面上的情形 | 分类结果 |
 | --- | --- |
@@ -179,8 +201,8 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 
 "实时尾部" = `inFlight` 时 run 里最后一个非 decor 子节点；`inFlight` = `anyPending || active`
 （`computeFoldLayout()` 的 `active` 参数由 `index.ts` 的 `agent_start` / `agent_settled` 维护）。
-run 结算后尾部就是最后一条 "不含 toolCall 的 assistant"（决策四的老规则），此时任何仍可见的
-思考都会被遮罩。
+run 结算后尾部就是最后一条 "不含 toolCall 的 assistant"（决策四的老规则），此时 `hideThinking`
+开着的话，任何仍可见的思考都会被遮罩。
 
 思考的"实时"判据是**消息内容级**的，不是状态机级的：一个 thinking run 只有在"它后面没有可见内容"
 且"这条消息是尾部"时才留在屏幕上。所以模型从思考切到正文的那一帧，思考就折了（`index.ts` 在
@@ -220,7 +242,7 @@ run 结算后尾部就是最后一条 "不含 toolCall 的 assistant"（决策�
 
 run 的时长 = `第一个 assistant 的开始时刻 → run 结束`。run 还在飞时“结束”就是 `now`（所以工具
 时间计入、数字一直走），`agent_settled` 之后用最后一个 assistant 的完成时刻——两者连续，结算时
-不会跳变。展开状态不持久化。
+不会跳变。折叠开关不持久化。
 
 摘要里的 `toolCount` / `N thinking` 统计的是**已经被折掉的东西**：正作为实时尾部显示的那一步
 （正在跑的工具、正在流的思考）不算在内，等它折下去时才 +1。所以运行期间数字只增不减，且屏幕上
@@ -329,7 +351,7 @@ run 的时长 = `第一个 assistant 的开始时刻 → run 结束`。run 还�
 
 时序是照 `interactive-mode.ts` 逐行复刻的：扩展事件先于 UI 组件创建、流式用
 `streamingComponent`、工具行由 `message_update` 的 `toolCall` 块创建、`agent_end` 摘掉残留
-streaming 组件并清 `pendingTools`。
+streaming 组件并清 `pendingTools`。下表同样按三类全折的策略描述。
 
 | 场景 | 结果 |
 | --- | --- |
