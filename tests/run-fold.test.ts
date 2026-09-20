@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 // Since Pi 0.84 `TUI` is no longer re-exported from pi-coding-agent; it is
 // defined in pi-tui (pi-coding-agent 0.83 exported both).
-import { Container, Text, TuiMainScreen, type Terminal, type TUI } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, TuiMainScreen, type Terminal, type TUI } from "@earendil-works/pi-tui";
 import runFoldExtension, {
   DEFAULT_RUN_FOLD_OPTIONS,
   assertRunFoldPatch,
@@ -921,6 +921,74 @@ test("folding survives a transcript rebuild (/compact, /tree, resume)", async ()
   assert.equal(AssistantMessageComponent.prototype.render, nativeAssistantRender);
 });
 
+test("a steer folds the steps it cut off instead of leaving them expanded", () => {
+  const chat = new Container();
+  // A steer arrives the way Pi renders one: the interrupted run, then the spacer
+  // and `UserMessageComponent` a fresh prompt gets too. Nothing in those
+  // components says "steer" - what says it is that the run before them never
+  // answered, because the steer took the answer away from it.
+  chat.addChild(
+    assistantComponent(
+      assistant({
+        timestamp: T0,
+        thinking: "先看看这个",
+        tools: [{ id: "a", name: "read" }],
+        stopReason: "toolUse",
+      }),
+    ),
+  );
+  chat.addChild(toolComponent("a", "read", "file body"));
+  chat.addChild(new Spacer(1));
+  chat.addChild(new UserMessageComponent("请你先说说方案", markdownTheme));
+  // The run the steer started ends in an answer and folds as it always did.
+  chat.addChild(
+    assistantComponent(
+      assistant({
+        timestamp: T0 + 10_000,
+        thinking: "他说要方案",
+        tools: [{ id: "b", name: "bash" }],
+        stopReason: "toolUse",
+      }),
+    ),
+  );
+  chat.addChild(toolComponent("b", "bash", "output body"));
+  chat.addChild(assistantComponent(assistant({ timestamp: T0 + 20_000, thinking: "方案从这里开始", text: "方案如下。" })));
+
+  const patch = installRunFoldPatch(options);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(
+    timingsSource(
+      new Map([
+        [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+        [T0 + 10_000, { startedAt: T0 + 10_000, completedAt: T0 + 12_000 }],
+        [T0 + 20_000, { startedAt: T0 + 20_000, completedAt: T0 + 25_000 }],
+      ]),
+    ),
+  );
+  try {
+    const text = plain(chat.render(70)).filter(Boolean).join("\n");
+    assert.match(text, /▸ read · 1 thinking · 1\.0s\s+\(f2 to expand\)/, "the cut-off steps fold into a mark");
+    assert.doesNotMatch(text, /先看看这个|file body/, "and nothing of them stays on screen");
+    assert.match(text, /请你先说说方案/, "the steer itself stays where Pi put it");
+    assert.match(text, /▸ bash · 2 thinking · 15\.0s/, "the run it started folds as usual");
+    assert.match(text, /方案如下。/, "and keeps its answer");
+    assert.doesNotMatch(text, /方案从这里开始/, "the answer's reasoning folds into that mark");
+
+    // The steer landed while the agent was still working, which is when this has
+    // to hold: the cut-off steps are already history on that frame, not once the
+    // run after them settles.
+    patch.setRunActive(true);
+    patch.refresh();
+    const live = plain(chat.render(70)).filter(Boolean).join("\n");
+    assert.match(live, /▸ read · 1 thinking · 1\.0s/, "the cut-off steps stay folded while the agent works");
+    assert.doesNotMatch(live, /先看看这个|file body/);
+    assert.match(live, /请你先说说方案/);
+  } finally {
+    patch.dispose();
+  }
+});
+
 test("an aborted run expands again so its error output stays visible", async () => {
   const chat = new Container();
   const aborted = assistant({ timestamp: T0, thinking: "先跑测试", tools: [{ id: "x", name: "bash" }], stopReason: "toolUse" });
@@ -945,6 +1013,16 @@ test("an aborted run expands again so its error output stays visible", async () 
     assert.match(settled.join("\n"), /先跑测试/);
     assert.match(settled.join("\n"), /Aborted after 1 retry attempt/);
     assert.doesNotMatch(settled.join("\n"), /to expand/);
+
+    // The next prompt makes the aborted run a superseded one. A run that cut off
+    // because it failed still keeps its output: that is the result, not history.
+    chat.addChild(new Spacer(1));
+    chat.addChild(new UserMessageComponent("换个方向", markdownTheme));
+    patch.refresh();
+    const afterNextPrompt = plain(chat.render(70)).filter(Boolean);
+    assert.match(afterNextPrompt.join("\n"), /先跑测试/);
+    assert.match(afterNextPrompt.join("\n"), /Aborted after 1 retry attempt/);
+    assert.doesNotMatch(afterNextPrompt.join("\n"), /to expand/);
   } finally {
     patch.dispose();
   }

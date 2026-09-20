@@ -229,6 +229,8 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 | `[A1(toolUse), T1, T2, A2(stop)]`（run 结束） | 藏 A1/T1/T2，保留 A2，**并遮掉 A2 自己的思考**（它已经是历史，不再是最新活动） |
 | `[A1(stop, thinking only)]`（只思考、被 abort / settle） | 没有正文可留 → 思考原样保留（那是结果，不是过程） |
 | `[A1(toolUse), T1(错误)]`（abort 之后 `agent_settled` 已到） | 没有回答、run 也已结束 → **不折叠**，错误输出留给用户 |
+| 同上，但后面又接了新 prompt | run 变成“被边界截断”，但它是**失败收尾**的 → 仍然**不折叠** |
+| steer：`[A1(toolUse), T1, <用户消息>, A2(stop)]` | 边界截住了它、而它既没有回答也没失败 → A1/T1 **折成摘要**，用户消息留在 Pi 放它的位置 |
 | auto-retry：`[A1(error), A2(stop)]` | 失败的尝试跟着步骤一起折进去（想要的效果） |
 
 "实时尾部" = `inFlight` 时 run 里最后一个非 decor 子节点；`inFlight` = `anyPending || active`
@@ -241,6 +243,11 @@ run 结算后尾部就是最后一条 "不含 toolCall 的 assistant"（决策�
 `message_update` 上 `refresh()`，不必等下一秒的 tick）。
 
 "abort 之后不折叠"是刻意的：那时工具行里的错误文本就是用户要的结果，折成一个空摘要等于藏了它。
+于是“没有回答的 run”要分两种：**失败**（abort / error / 最后一行工具报错）保留输出，**被边界截断**
+（steer、follow-up、banner、compaction summary 来了）则按普通 run 折叠——它没有回答只是因为回答被
+用户下一句话接走了，不是因为它留下了结果。被截断的 run 连“最新一步”也不再算实时尾部（`isTail` 只在
+run 还没结束时成立），它最后的 thinking 一样折进摘要。判据是 run 里**最后一个非 decor 子节点**：只有
+它失败才算这个 run 是失败收尾的（中途某个工具报错不影响）。
 反过来说，“工具返回但下一条消息还没开始”这个空档必须靠 run 级状态判定：只看子组件的 pending
 标志时它和 abort 长得一模一样，会让 `F2` 在这一瞬失效、并在下一条消息开始流式时突然自己折上。
 
@@ -392,7 +399,7 @@ streaming 组件并清 `pendingTools`。下表同样按三类全折的策略描�
 | 工具跑到一半 abort | 工具被标错误后**自动展开**，错误文本可见 |
 | 回答自带思考（本轮修的）：`思考 → 正文` | 思考不再卡在最后（`...-Thinking-Text`），正文照旧；思考计入摘要的 `N thinking` |
 | `/compact` 后 `clear()` + 从 entries 重建 | **自动重新折叠**，计时取自 `entry.timestamp` |
-| steer（流式中插话） | 摘要位置不动；插话成为新的 run 边界 |
+| steer（流式中插话） | 摘要位置不动；插话成为新的 run 边界，被截断的那一段没有回答也没失败 → **折成摘要** |
 | `session_shutdown` | 补丁卸载，transcript 完全恢复原生渲染 |
 
 ### 4.2 性能
@@ -409,7 +416,8 @@ folded + refresh() every frame   2.09 ms/frame     ← 最坏情况；实际每�
 
 ### 4.3 测试
 
-23 个测试覆盖：run 分组与边界、实时尾部（工具在手 / 工具已返回的空档 / 思考流式）、
+34 个测试覆盖：run 分组与边界、被 steer 截断的 run（vs 失败收尾的 run）、实时尾部（工具在手 /
+工具已返回的空档 / 思考流式）、
 推理遮罩（答案自带思考、思考切正文、`MouseRegion` 包装层、布局不识别时退回原生）、
 run 级 ticker 与时长、摘要格式化与按宽截断、prototype 包装与还原、外来补丁后的自愈、
 abort 后展开、transcript 重建、container 发现、offscreen 重绘（假 terminal + 真 `TuiMainScreen` +
@@ -446,8 +454,10 @@ bun install   # 回到 ^0.84.3
   要等桥接组件下一次 render 才成功；中间那一帧按原生渲染（此时本来也没内容可折）。
   恢复会话时这意味着启动阶段那帧原生 transcript 需要靠 `/run-fold redraw`（或 fullscreen）才能
   显示折叠后的样子（见下一条）。
-- **还没产出回答就被打断的 run 保留输出。** abort、或回答生成前被 steer 打断时，工具行与
-  错误文本留给你看，不会折成一个空摘要。见 §2.2 决策四。
+- **失败收尾的 run 保留输出。** abort、或最后一行工具报错时，工具行与错误文本留给你看，不会折
+  成一个空摘要。回答生成前被 steer 打断则不同：那一段没有回答、也不算失败，会折成摘要（见 §2.2
+  决策四）。代价是"steer 之前那一步正好报错"这种形状会整段留在屏幕上——它在转录里和 abort 长得
+  一模一样，没有可靠的信号可以区分。
 - **run 运行期间 transcript 会一涨一缩。** 实时尾部意味着每出现一步就多几行、下一步开始时再
   收回去；regular 模式下这些变矮会走 clear-on-shrink（见下一条）。fullscreen 模式里 transcript
   是 ScrollView，原地重排，没有这个问题——如果你在意实时尾部的观感，`--tui-mode fullscreen`。

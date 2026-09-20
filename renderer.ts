@@ -18,7 +18,10 @@ import { Container, truncateToWidth, type Component } from "@earendil-works/pi-t
  * Intermediate text, thinking runs, and tool rows fold independently, so a step
  * the fold has nothing left to take from stays visible as it is - and a run whose
  * steps stay on screen gets one summary per stretch of folded rows, not one for
- * the whole run.
+ * the whole run. A steer or follow-up Pi delivers mid-turn arrives as a user
+ * message in the middle of the run it interrupted: the message stays where Pi
+ * put it, and the steps before it fold as history, because the run they belong to
+ * no longer has an answer of its own.
  *
  * Pi gives extensions no transcript hook, so this module wraps the two
  * component classes that make up a run (`AssistantMessageComponent` and
@@ -41,8 +44,10 @@ export interface RunFoldOptions {
   /** Fold runs at all. When false every run renders natively. */
   folded: boolean;
   /**
-   * Assistant text from steps that only call tools. The answer's own text and
-   * the content of an answerless run are never folded away.
+   * Assistant text from steps that only call tools. The answer's own text is
+   * never folded away, and neither is the content of an answerless run - unless
+   * a boundary cut that run off, since then its steps are as much history as any
+   * other run's.
    */
   hideIntermediateText: boolean;
   /** Reasoning runs, including the ones inside a message that stays visible. */
@@ -87,8 +92,17 @@ export type RunChildClassification =
       hasNote: boolean;
       /** Still streaming, or a provider that reports a pending stop reason. */
       pending: boolean;
+      /** The run never finished: this message is where it was aborted or errored. */
+      failed: boolean;
     }
-  | { group: "run"; kind: "tool"; toolName?: string; pending: boolean }
+  | {
+      group: "run";
+      kind: "tool";
+      toolName?: string;
+      pending: boolean;
+      /** The tool came back an error, so a run ending here ended on a failure. */
+      failed: boolean;
+    }
   /** Custom cards/entries inside a run: kept visible, never a run boundary. */
   | { group: "run"; kind: "decor" };
 
@@ -184,7 +198,7 @@ interface AssistantInternals {
 
 interface ToolInternals {
   toolName?: string;
-  result?: unknown;
+  result?: { isError?: boolean };
   isPartial?: boolean;
 }
 
@@ -251,9 +265,24 @@ function toolIsPending(component: Component): boolean {
 }
 
 /**
+ * Did the run stop on a failure? Only the last row inside it gets a say: a tool
+ * that errored halfway through says nothing about how the run ended, while the
+ * row it ended on is what the reader has to be left with.
+ */
+function endedInFailure(run: readonly ClassifiedChild[]): boolean {
+  for (let index = run.length - 1; index >= 0; index -= 1) {
+    const classification = runChild(run[index]!.classification);
+    if (!classification || classification.kind === "decor") continue;
+    return classification.failed;
+  }
+  return false;
+}
+
+/**
  * Classify a chat-container child. Anything that is not an assistant, tool, or
- * decor component ends the current run (user prompts, banners, bash rows,
- * compaction summaries, status text, spacers, ...).
+ * decor component ends the current run (user prompts - a steer Pi delivered
+ * mid-turn is one of those - banners, bash rows, compaction summaries, status
+ * text, spacers, ...).
  */
 export function classifyRunChild(component: Component): FoldClassification {
   if (isAssistant(component)) {
@@ -271,14 +300,19 @@ export function classifyRunChild(component: Component): FoldClassification {
       // Pi draws these two rows even when the message has nothing else to say.
       hasNote: stopReason === "length" || (!toolCalls && (stopReason === "aborted" || stopReason === "error")),
       pending: internals.isStreaming === true || stopReason === "pending",
+      // Not `length`: a truncated message either carries text (an answer) or its
+      // tool calls come back as errors, which the tool row itself reports.
+      failed: stopReason === "aborted" || stopReason === "error",
     };
   }
   if (isTool(component)) {
+    const internals = component as ToolInternals;
     return {
       group: "run",
       kind: "tool",
-      toolName: (component as ToolInternals).toolName,
+      toolName: internals.toolName,
       pending: toolIsPending(component),
+      failed: internals.result?.isError === true,
     };
   }
   if (isDecor(component)) return { group: "run", kind: "decor" };
@@ -389,8 +423,11 @@ function summarizeStretch(
  *   being produced - without the transcript growing with every step.
  * - Once the run settles only its answer survives: every step folds, and the
  *   reasoning inside the answer folds with them, because by then it is history
- *   rather than activity. A settled run without an answer (aborted or failed)
- *   keeps its content: that output is the result.
+ *   rather than activity. A settled run without an answer keeps its content only
+ *   when that content is the result - it failed, or it is still the end of the
+ *   transcript. A boundary that cut it off first (`superseded`) makes it fold
+ *   like any other finished run: a steer or a follow-up arrived, so whatever the
+ *   run was doing is history, not an answer the reader is waiting on.
  */
 function foldRun(
   run: readonly ClassifiedChild[],
@@ -398,6 +435,7 @@ function foldRun(
   options: RunFoldOptions,
   timings: TimingSource,
   active: boolean,
+  superseded: boolean,
 ): void {
   let lastAnswer = -1;
   let lastStep = -1;
@@ -415,6 +453,9 @@ function foldRun(
   let visibleFrom: number;
   if (inFlight) visibleFrom = lastStep;
   else if (lastAnswer >= 0) visibleFrom = lastAnswer;
+  // Nothing of a superseded run belongs on screen: its steps are history for the
+  // same reason a folded run's are, and it has no answer of its own to keep.
+  else if (superseded && !endedInFailure(run)) visibleFrom = run.length;
   else return;
   if (visibleFrom < 0) return;
 
@@ -447,8 +488,10 @@ function foldRun(
     if (!keepsThinking && classification.thinkingRuns > 0) mask.thinking = true;
     if (!mask.text && !mask.thinking) return;
     // Reasoning is the run's live activity only while it is what the run is
-    // currently producing: the newest child, still without text of its own.
-    const isTail = index === lastStep;
+    // currently producing: the newest child, still without text of its own, of a
+    // run that still has something to produce. A run a boundary cut off has
+    // none - its newest child is as much history as the steps before it.
+    const isTail = index === lastStep && !superseded;
     if (mask.thinking && isTail && !classification.hasText) return;
     folded.push({
       entry,
@@ -550,19 +593,22 @@ export function computeFoldLayout(
 
   let run: ClassifiedChild[] = [];
   // Only the trailing run can still be in flight; every earlier run is settled.
-  const flush = (runActive = false) => {
-    if (run.length > 0) foldRun(run, layout, options, timings, runActive);
+  // A boundary flush marks the run as superseded: something - a user message Pi
+  // delivered mid-turn (a steer, a follow-up), a banner, a compaction summary -
+  // came next, so the run never reached the end of the transcript on its own.
+  const flush = (runActive: boolean, superseded: boolean) => {
+    if (run.length > 0) foldRun(run, layout, options, timings, runActive, superseded);
     run = [];
   };
   for (const child of children) {
     const classification = classifyRunChild(child);
     if (classification.group === "boundary") {
-      flush();
+      flush(false, true);
       continue;
     }
     run.push({ component: child, classification });
   }
-  flush(active);
+  flush(active, false);
   return layout;
 }
 
