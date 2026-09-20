@@ -25,6 +25,7 @@ import runFoldExtension, {
   formatToolNames,
   installRunFoldPatch,
   renderRunSummaryLines,
+  statusText,
   type RunFoldOptions,
   type TimingSource,
 } from "../index.ts";
@@ -638,6 +639,7 @@ test("folding survives a transcript rebuild (/compact, /tree, resume)", async ()
         bridge?.dispose?.();
         bridge = factory?.(bridgeTui) as typeof bridge;
       },
+      setStatus() {},
       notify() {},
     },
     sessionManager: { getEntries: () => entries },
@@ -750,6 +752,7 @@ test("/run-fold command and value aliases reach the same branch as their canonic
     hasUI: true,
     ui: {
       theme,
+      setStatus() {},
       notify(message: string) {
         notifications.push(message);
       },
@@ -791,6 +794,97 @@ test("/run-fold command and value aliases reach the same branch as their canonic
   assert.match(unknown ?? "", /Usage: \/run-fold/, "the old plural name is not an alias");
 });
 
+test("the status line names the kinds the fold hides", () => {
+  const base = { ...DEFAULT_RUN_FOLD_OPTIONS };
+  assert.equal(statusText(base), "folded(think,tool)", "the shipped default hides two kinds");
+  assert.equal(statusText({ ...base, hideIntermediateText: true }), "folded", "all three needs no parentheses");
+  assert.equal(statusText({ ...base, hideIntermediateText: true, hideThinking: false }), "folded(text,tool)");
+  assert.equal(statusText({ ...base, hideThinking: false }), "folded(tool)");
+  assert.equal(statusText({ ...base, hideToolCalls: false }), "folded(think)");
+  assert.equal(
+    statusText({ ...base, hideIntermediateText: false, hideThinking: false, hideToolCalls: false }),
+    undefined,
+    "a fold that takes nothing away says nothing",
+  );
+  assert.equal(statusText({ ...base, folded: false }), undefined, "and neither does a fold that is off");
+});
+
+test("the status line follows the commands and can be turned off", async () => {
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => unknown }>();
+  const pi = {
+    on() {},
+    registerShortcut() {},
+    registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionContext) => unknown }) {
+      commands.set(name, command);
+    },
+  } as unknown as ExtensionAPI;
+
+  const statuses: Array<string | undefined> = [];
+  const notifications: string[] = [];
+  // The footer prints extension statuses undimmed while the rest of its lines are
+  // dim, so the extension has to dim its own text - remember the colors it asks
+  // for and let the text through unchanged.
+  const colors: string[] = [];
+  const spyTheme = {
+    fg(color: string, text: string) {
+      colors.push(`${color}:${text}`);
+      return text;
+    },
+  } as unknown as Theme;
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      theme: spyTheme,
+      setStatus(_key: string, text: string | undefined) {
+        statuses.push(text);
+      },
+      notify(message: string) {
+        notifications.push(message);
+      },
+    },
+    sessionManager: { getEntries: () => [] },
+  } as unknown as ExtensionContext;
+
+  runFoldExtension(pi);
+  const run = async (args: string) => {
+    statuses.length = 0;
+    notifications.length = 0;
+    colors.length = 0;
+    await commands.get("run-fold")!.handler(args, ctx);
+    return statuses.at(-1);
+  };
+
+  // Start from a known strategy rather than whatever the tests before left behind.
+  await run("fold on");
+  await run("text off");
+  await run("thinking on");
+  await run("tool on");
+  await run("statusline on");
+
+  assert.equal(await run("status"), "folded(think,tool)");
+  assert.deepEqual(colors, ["dim:folded(think,tool)"], "dim, like the rest of the footer");
+  assert.equal(await run("text on"), "folded");
+  assert.equal(await run("think off"), "folded(text,tool)");
+  assert.equal(await run("tool off"), "folded(text)");
+  assert.equal(await run("text off"), undefined, "nothing to hide: the line is cleared");
+  assert.equal(await run("fold off"), undefined);
+  assert.equal(await run("think on"), undefined, "folding is off, so the flag does not matter");
+  await run("fold on");
+  assert.equal(await run("think on"), "folded(think)");
+
+  assert.equal(await run("statusline off"), undefined, "turned off, the line is cleared");
+  assert.equal(await run("statusline on"), "folded(think)");
+  assert.equal(await run("statusline toggle"), undefined, "toggle flips it off");
+  assert.equal(await run("statusline"), "folded(think)", "and with no value it flips back");
+
+  statuses.length = 0;
+  notifications.length = 0;
+  await commands.get("run-fold")!.handler("statusline maybe", ctx);
+  assert.equal(statuses.length, 0, "an unknown value leaves the line alone");
+  assert.match(notifications.at(-1) ?? "", /Usage: \/run-fold statusline/);
+});
+
 test("the extension folds a live transcript, toggles with the shortcut, and cleans up", async () => {
   const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
   const shortcuts = new Map<string, { handler: (ctx: ExtensionContext) => unknown }>();
@@ -826,6 +920,7 @@ test("the extension folds a live transcript, toggles with the shortcut, and clea
         bridge?.dispose?.();
         bridge = factory?.(bridgeTui);
       },
+      setStatus() {},
       notify() {},
     },
     sessionManager: {
@@ -1030,6 +1125,7 @@ test("the ticker runs for the whole agent run, not only while a message streams"
       setWidget(_key: string, factory: ((tui: TUI) => unknown) | undefined) {
         factory?.(bridgeTui);
       },
+      setStatus() {},
       notify() {},
     },
     sessionManager: { getEntries: () => [] },
@@ -1159,6 +1255,7 @@ test("/run-fold redraw repaints offscreen runs through a scrollback preserver", 
       setWidget(_key: string, factory: ((tui: TUI) => unknown) | undefined) {
         bridge = factory?.(tui as unknown as TUI) as { render(width: number): string[] } | undefined;
       },
+      setStatus() {},
       notify(message: string) {
         notifications.push(message);
       },

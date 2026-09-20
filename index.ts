@@ -18,6 +18,7 @@ import {
 } from "./renderer.ts";
 
 export const RUN_FOLD_WIDGET_KEY = "run-fold-render-bridge";
+export const RUN_FOLD_STATUS_KEY = "run-fold";
 const TICK_INTERVAL_MS = 1000;
 
 /**
@@ -59,6 +60,8 @@ export default function (pi: ExtensionAPI) {
   let runActive = false;
   /** `/run-fold repaint on`: repaint the whole transcript when a fold touches offscreen runs. */
   let repaintOffscreen = false;
+  /** `/run-fold statusline off`: leave the shared footer line to the other extensions. */
+  let statusLineVisible = true;
   let offscreenHintShown = false;
 
   const useTimings = () => {
@@ -71,6 +74,22 @@ export default function (pi: ExtensionAPI) {
   const refresh = () => {
     patch?.refresh();
     requestRender?.();
+  };
+
+  /**
+   * Keep the footer in step with the strategy. Option-only, so it is O(1) and
+   * belongs on the commands that change the options - never in `refresh()`, which
+   * the ticker calls every second.
+   */
+  const syncStatus = (context: ExtensionContext) => {
+    if (context.mode !== "tui") return;
+    const text = statusLineVisible && patch ? statusText(patch.options) : undefined;
+    // Pi prints extension statuses as-is while every other footer line is dim, so
+    // the text has to dim itself to sit at the same weight as its neighbours.
+    context.ui.setStatus(
+      RUN_FOLD_STATUS_KEY,
+      text === undefined ? undefined : context.ui.theme.fg("dim", text),
+    );
   };
 
   const stopTicker = () => {
@@ -252,6 +271,7 @@ export default function (pi: ExtensionAPI) {
       { placement: "belowEditor" },
     );
 
+    syncStatus(context);
     refresh();
   });
 
@@ -314,6 +334,7 @@ export default function (pi: ExtensionAPI) {
     requestRender = undefined;
     if (context.hasUI) {
       context.ui.setWidget(RUN_FOLD_WIDGET_KEY, undefined);
+      context.ui.setStatus(RUN_FOLD_STATUS_KEY, undefined);
     }
     patch?.dispose();
     patch = undefined;
@@ -321,9 +342,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerShortcut(DEFAULT_RUN_FOLD_TOGGLE_KEY, {
     description: "Toggle run folding (expand/collapse agent runs)",
-    handler: async () => {
+    handler: async (context) => {
       patch?.toggle();
       afterFoldChange();
+      syncStatus(context);
     },
   });
 
@@ -374,6 +396,16 @@ export default function (pi: ExtensionAPI) {
           repaintOffscreen = value === "on" || value === "true";
           refresh();
           break;
+        case "statusline": {
+          if (value === "on") statusLineVisible = true;
+          else if (value === "off") statusLineVisible = false;
+          else if (value === undefined || value === "toggle") statusLineVisible = !statusLineVisible;
+          else {
+            context.ui.notify("Usage: /run-fold statusline [toggle|on|off]", "warning");
+            return;
+          }
+          break;
+        }
         case "redraw":
           if (forceFullRedraw()) offscreenHintShown = true;
           else context.ui.notify("run-fold: nothing to repaint (no offscreen runs in this TUI)", "info");
@@ -382,15 +414,18 @@ export default function (pi: ExtensionAPI) {
           break;
         default:
           context.ui.notify(
-            "Usage: /run-fold [toggle|collapse|expand|fold|text|thinking|tool|repaint <on|off>|redraw|status] " +
+            "Usage: /run-fold [toggle|collapse|expand|fold|text|thinking|tool|repaint <on|off>] " +
+              "[statusline <toggle|on|off>|redraw|status] " +
               "(aliases: intermediateText = text, think = thinking, toolcalls = tool; on = collapse, off = show = expand)",
             "warning",
           );
           return;
       }
+      syncStatus(context);
       refresh();
       context.ui.notify(
-        `run-fold: ${describeOptions(patch.options)} · offscreen repaint ${repaintOffscreen ? "on" : "off"}`,
+        `run-fold: ${describeOptions(patch.options)} · offscreen repaint ${repaintOffscreen ? "on" : "off"} · ` +
+          `statusline ${statusLineVisible ? "on" : "off"}`,
         "info",
       );
     },
@@ -404,6 +439,25 @@ export default function (pi: ExtensionAPI) {
  */
 function parseToggle(value: string | undefined): boolean {
   return value !== "off" && value !== "show" && value !== "expand";
+}
+
+/**
+ * The footer status line, or undefined for "leave the line to the other
+ * extensions".
+ *
+ * The line is shared with every extension and sorted by key, so this stays
+ * short: the parentheses list the kinds the fold is configured to take away -
+ * bare `folded` when that is all three, and nothing at all when it is none of
+ * them, since the fold then has nothing to do.
+ */
+export function statusText(options: RunFoldOptions): string | undefined {
+  if (!options.folded) return undefined;
+  const hidden: string[] = [];
+  if (options.hideIntermediateText) hidden.push("text");
+  if (options.hideThinking) hidden.push("think");
+  if (options.hideToolCalls) hidden.push("tool");
+  if (hidden.length === 0) return undefined;
+  return hidden.length === 3 ? "folded" : `folded(${hidden.join(",")})`;
 }
 
 function describeOptions(options: RunFoldOptions): string {

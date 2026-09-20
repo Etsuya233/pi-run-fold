@@ -68,11 +68,22 @@ pi remove  ~/programming/run-fold
 | `/run-fold thinking on\|off`（别名 `think`） | 隐藏 / 保留思考（默认隐藏） |
 | `/run-fold tool on\|off`（别名 `toolcalls`） | 隐藏 / 保留工具调用行（默认隐藏） |
 | `/run-fold repaint on\|off` | 折叠涉及视口上方时整屏重绘 |
+| `/run-fold statusline on\|off\|toggle` | 开关 footer 上的 `folded` 状态（不带值 = toggle） |
 | `/run-fold redraw` | 立刻整屏重绘一次 |
 | `/run-fold status` | 打印当前策略 |
 
 取值统一：`on` = `collapse`（折起 / 隐藏），`off` = `show` = `expand`（展开 / 保留）；
 不给值等于 `on`。所以 `/run-fold text collapse`、`/run-fold text on`、`/run-fold text` 是同一件事。
+（`statusline` 自己一套：`on` / `off` / 不带值或 `toggle`。）
+
+**footer 状态栏**：`folded` 会显示在 Pi footer 的最后一行，和别的扩展的状态并排（按 key
+字母序）。三项都折才写裸的 `folded`，否则括号里列出**被折掉的类目**，按正文、思考、工具的顺序：
+默认是 `folded(think,tool)`，`/run-fold text on` 后是 `folded`，`/run-fold think off` 后是
+`folded(tool)`。三项都不折（插件此时等于没作用）或 `fold off` 时不显示任何东西。
+它读的是**策略**而不是当前屏幕（O(1)，不扫 transcript）：一个没有工具调用的 run 上也会写
+`folded(think,tool)`。文本自己套 `theme.fg("dim", …)` —— Pi 打印扩展状态时不套颜色，而 footer
+其余行都是 dim，不自己 dim 就会比周围亮一档。`/run-fold statusline off` 把它关掉，`statusline` 或
+`statusline toggle` 来回切。
 
 默认就是"工具和思考太吵"模式：中间正文留在原地，工具行与思考折进摘要那一行
 （`▸ read · 2 thinking · 6.3s`）。三类内容各管各的：`/run-fold text on` 连正文一起折，
