@@ -1,18 +1,19 @@
 # pi-run-fold
 
-> Fold each agent run in Pi's TUI into one summary line. A run keeps its prompt,
-> its intermediate text (by default), and its final answer; tool rows, tool
-> output, and reasoning collapse into that one line - while the run works, the
-> newest step (the running tool, the streaming text, or the reasoning being
-> produced) stays on screen as the live tail. Intermediate text, thinking, and
-> tool calls fold independently (`/run-fold text|thinking|tool on|off`), and
+> Fold each agent run in Pi's TUI into summary lines. A run keeps its prompt, its
+> intermediate text (by default), and its final answer; tool rows, tool output,
+> and reasoning collapse into one summary line per folded stretch - while the run
+> works, the newest step (the running tool, the streaming text, or the reasoning
+> being produced) stays on screen as the live tail. Intermediate text, thinking,
+> and tool calls fold independently (`/run-fold text|thinking|tool on|off`), and
 > `F2` turns folding off entirely.
 > Display-only: no session entries, no message mutation, no model-context change.
 > *This document is written in Chinese because it is a design note; the extension
 > itself and its API are English.*
 
-一个 Pi 扩展原型：把**一个 agent run** 折叠成"用户输入 + 一行摘要 + 最终回答"，
-运行期间只额外保留**最新的一步**当作实时尾部。
+一个 Pi 扩展原型：把**一个 agent run** 折叠成"用户输入 + 摘要 + 最终回答"，
+运行期间只额外保留**最新的一步**当作实时尾部。留在屏幕上的行会把折叠**切成若干段**，
+每一段各出一行摘要（见 §2.2 决策三）。
 
 运行中的样子（第 4 步 = 下一轮思考正在流式输出）：
 
@@ -181,15 +182,35 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 | 思考了几次 | content 里**连续** thinking 块算 1 次 |
 | 用了哪些工具 | `component.toolName` |
 
-#### 决策三：摘要行由「该 run 第一个被折掉的东西」渲染，而不是新插入一个组件
+#### 决策三：每一段连续的折叠各出一行摘要，宿主是"该段第一个被整条折掉的行"
 
-因为第一个被折掉的东西——默认是第一条工具行，三类全折时是第一个中间步骤——**本来就在摘要该在
-的位置上**（用户消息之后第一个中间步骤），它的高度变化由 Pi 的 `mouseLayout` 自动记账，点击区域
-也天然落在它身上（后续要做"点摘要展开"只需给这个实例挂 `handleMouse`）。
+不在 run 级别只出一行，是因为**留在屏幕上的行会把折叠切段**：默认策略下正文留在原地，
+中间的工具行就成了正文之间的几个空档。若全 run 只出一行，它只能挂在第一段上，后面几段就
+渲染成 0 行——内容凭空消失，而那一行上的 `read ×3` 又和它所在的位置（只折了一次）对不上。
+所以按"夹在可见内容之间的折叠"切段，每段自己造摘要、自己数数、自己计时（§2.4），印在它折掉的
+东西原来的位置上。
 
-一个 run 里只有一个组件渲染摘要：被整条藏掉的第一个子节点；如果这个 run 没有任何东西被整条藏掉，
-就是第一条只被遮罩的步骤（摘要印在它上面）。关掉折叠时布局表为空，摘要随之消失——因为渲染它的
-组件自己也不再被隐藏。
+归附方向：一条被遮罩的行折掉的内容（也就是它自己的思考）算在**它下面那个标记**里（它的正文
+在屏上，标记落在它下面）；下面没有标记时算在**上面那个**里；上下都没有（整条 run 只有它一个可折
+的东西）才自己印一行。所以回答的思考通常被上一行吸收（得到 `▸ read · 2 thinking`，而不是
+`▸ read · 1 thinking` 紧跟 `▸ 1 thinking`），而合并只发生在**相邻**的两段之间 —— 标记永远不会
+跳过读者看得见的东西去合并。
+
+切段的判据是"这一行**画不画得出东西**"，而不是"它有没有被折掉"（`drawsRows()`：被折掉的行看
+`mask` 之后还剩什么，没被折掉的行看它自己有没有正文/思考/截断备注）。两个方向都得堵住：
+
+- 模型经常单独发一条**只含 tool call** 的 assistant 消息，Pi 给它的渲染结果是 **0 行**（没有正文、
+  没有思考，`updateContent` 连前导 Spacer 都不建）。这种行必须**透明**，否则两行摘要会贴在一起、
+  中间什么都没有，计数和时长也会从它那里被硬生生截断。
+- 反过来，"**思考被遮罩、正文留屏**"的步骤必须**切断**段落：它的正文就在屏幕上。若它不算边界，
+  那么标记落在哪里就取决于 provider 这一轮有没有返回 reasoning —— 同一份 transcript 的观感会随机
+  变样（这正是本条被拆两次才定下来的原因）。
+
+宿主仍是段内某个被折掉的现有组件，不新插入：它**本来就在摘要该在的位置上**，高度变化由 Pi 的
+`mouseLayout` 自动记账，点击区域也天然落在它身上（后续要做"点摘要展开"只需给这个实例挂
+`handleMouse`）。优先选段内第一个被**整条**折掉的行（默认策略下就是第一条工具行）；若这一段
+没有任何东西被整条折掉（比如只有段内多个步骤的思考被遮罩），就选第一个被遮罩的步骤，摘要
+印在它上面。关掉折叠时布局表为空，摘要随之消失——因为渲染它的组件自己也不再被隐藏。
 
 #### 决策四：实时尾部 + 「最终回答」
 
@@ -251,13 +272,14 @@ run 结算后尾部就是最后一条 "不含 toolCall 的 assistant"（决策�
 每秒 tick 一次。只在 assistant 流式期间 tick 的话，工具执行（`message_end` 之后、下一条消息
 开始之前）整段是死的，摘要就停在上一段消息的时长上。
 
-run 的时长 = `第一个 assistant 的开始时刻 → run 结束`。run 还在飞时“结束”就是 `now`（所以工具
-时间计入、数字一直走），`agent_settled` 之后用最后一个 assistant 的完成时刻——两者连续，结算时
-不会跳变。折叠开关不持久化。
+每一段的时长 = `该段开始 → 下一段可见消息开始`，其中"该段开始"就是上一段的结束（第一段则从 run
+的第一个 assistant 开始），所以各段首尾相接；最后一段结束于 run 的结束。run 还在飞时"结束"就是
+`now`（所以工具时间计入、数字一直走），`agent_settled` 之后用最后一个 assistant 的完成时刻——
+两者连续，结算时不会跳变。折叠开关不持久化。
 
-摘要里的 `toolCount` / `N thinking` 统计的是**已经被折掉的东西**：正作为实时尾部显示的那一步
-（正在跑的工具、正在流的思考）不算在内，等它折下去时才 +1。所以运行期间数字只增不减，且屏幕上
-看得见的东西不会被重复计入。
+摘要里的 `toolCount` / `N thinking` 统计的是**这一段里已经被折掉的东西**：正作为实时尾部显示的那
+一步（正在跑的工具、正在流的思考）不算在内，等它折下去时才 +1。所以运行期间数字只增不减，且屏幕
+上看得见的东西不会被重复计入。
 
 ### 2.5 一条没走的路（以及为什么）
 

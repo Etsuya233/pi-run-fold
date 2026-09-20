@@ -16,7 +16,9 @@ import { Container, truncateToWidth, type Component } from "@earendil-works/pi-t
  * text, or the reasoning being produced) stays on screen as the live tail; once
  * it settles the fold takes away whatever `RunFoldOptions` says it should.
  * Intermediate text, thinking runs, and tool rows fold independently, so a step
- * the fold has nothing left to take from stays visible as it is.
+ * the fold has nothing left to take from stays visible as it is - and a run whose
+ * steps stay on screen gets one summary per stretch of folded rows, not one for
+ * the whole run.
  *
  * Pi gives extensions no transcript hook, so this module wraps the two
  * component classes that make up a run (`AssistantMessageComponent` and
@@ -81,6 +83,8 @@ export type RunChildClassification =
       answerLike: boolean;
       /** The message carries text, so folding its reasoning still leaves content. */
       hasText: boolean;
+      /** The message draws a truncation/abort/error note of its own. */
+      hasNote: boolean;
       /** Still streaming, or a provider that reports a pending stop reason. */
       pending: boolean;
     }
@@ -116,9 +120,10 @@ export interface FoldMask {
 export interface FoldEntry {
   hidden: boolean;
   /**
-   * Set on the first folded child of a run: it renders the summary block. That
-   * child is usually hidden, but a run whose folded content all lives inside a
-   * message that stays visible renders the summary above that message.
+   * Set on one child of each folded stretch: it renders that stretch's summary.
+   * The host is usually a hidden child, but a stretch whose folded content all
+   * lives inside a message that stays visible renders the summary above that
+   * message.
    */
   summary?: RunSummary;
   /**
@@ -138,11 +143,24 @@ interface ClassifiedChild {
   classification: FoldClassification;
 }
 
-/** A child that stays on screen with some of its content masked away. */
-interface MaskedChild {
+/** A child the fold takes content from, in chat order. */
+interface FoldedRow {
   entry: ClassifiedChild;
-  mask: FoldMask;
-  /** This child is the run's tail, so its newest reasoning run is live activity. */
+  /**
+   * Index into the run: a row that stays on screen ends the stretch above it, so
+   * consecutive folded rows are what a single summary accounts for.
+   */
+  index: number;
+  /** The whole row goes; otherwise `mask` says which of its content goes. */
+  hidden: boolean;
+  mask?: FoldMask;
+  /**
+   * Whether the row still draws a line once the fold is done with it. A row that
+   * does is what the reader sees between two marks, so it ends the stretch above
+   * it - whether the fold took the whole row or only its reasoning.
+   */
+  renders: boolean;
+  /** This row is the run's tail, so its newest reasoning run is live activity. */
   keepTrailing: boolean;
 }
 
@@ -241,14 +259,18 @@ export function classifyRunChild(component: Component): FoldClassification {
   if (isAssistant(component)) {
     const internals = component as AssistantInternals;
     const message = internals.lastMessage;
+    const toolCalls = hasToolCalls(component);
+    const stopReason = message?.stopReason;
     return {
       group: "run",
       kind: "assistant",
       timestamp: message?.timestamp,
       thinkingRuns: countThinkingRuns(component),
-      answerLike: !hasToolCalls(component),
+      answerLike: !toolCalls,
       hasText: hasText(component),
-      pending: internals.isStreaming === true || message?.stopReason === "pending",
+      // Pi draws these two rows even when the message has nothing else to say.
+      hasNote: stopReason === "length" || (!toolCalls && (stopReason === "aborted" || stopReason === "error")),
+      pending: internals.isStreaming === true || stopReason === "pending",
     };
   }
   if (isTool(component)) {
@@ -263,71 +285,99 @@ export function classifyRunChild(component: Component): FoldClassification {
   return { group: "boundary" };
 }
 
-function assistantClassifications(
-  run: readonly ClassifiedChild[],
-): AssistantClassification[] {
-  const assistants: AssistantClassification[] = [];
+function runStartedAt(run: readonly ClassifiedChild[], timings: TimingSource): number | undefined {
   for (const entry of run) {
     const classification = runChild(entry.classification);
-    if (classification?.kind === "assistant") assistants.push(classification);
+    if (classification?.kind !== "assistant") continue;
+    return timings.timingFor(classification.timestamp)?.startedAt ?? classification.timestamp;
   }
-  return assistants;
+  return undefined;
 }
 
-function runTiming(
+/**
+ * Where the run ends. A run that is still in flight ends "now": tool execution
+ * and the gaps between messages belong to the run, and the number keeps moving
+ * instead of freezing on the last message that happened to finish. Once the run
+ * settles, the last message's completion is the end, so the value stays
+ * consistent.
+ */
+function runEndedAt(
   run: readonly ClassifiedChild[],
   timings: TimingSource,
   active: boolean,
-): Pick<RunSummary, "durationMs" | "live"> {
-  const assistants = assistantClassifications(run);
-  const first = assistants[0];
-  const last = assistants[assistants.length - 1];
-  if (!first || !last) return { live: false };
-
-  const startedAt = timings.timingFor(first.timestamp)?.startedAt ?? first.timestamp;
-  // A run that is still in flight ends "now": tool execution and the gaps
-  // between messages belong to the run, and the number keeps moving instead of
-  // freezing on the last message that happened to finish. Once the run settles,
-  // the last message's completion is the end, so the value stays consistent.
+): { endedAt: number | undefined; live: boolean } {
+  let last: AssistantClassification | undefined;
+  for (const entry of run) {
+    const classification = runChild(entry.classification);
+    if (classification?.kind === "assistant") last = classification;
+  }
+  if (!last) return { endedAt: undefined, live: false };
   const completedAt = active ? undefined : timings.timingFor(last.timestamp)?.completedAt;
-  const live = active || completedAt === undefined;
-  const endedAt = completedAt ?? timings.now();
-  if (startedAt === undefined || !Number.isFinite(startedAt) || !Number.isFinite(endedAt)) {
-    return { live };
-  }
-  return { durationMs: Math.max(0, endedAt - startedAt), live };
+  if (completedAt !== undefined) return { endedAt: completedAt, live: false };
+  return { endedAt: timings.now(), live: true };
 }
 
-function summarizeRun(
+/** Where the next assistant message after `index` starts: a stretch's end. */function nextAssistantStart(
   run: readonly ClassifiedChild[],
-  hidden: readonly ClassifiedChild[],
-  masked: readonly MaskedChild[],
+  index: number,
   timings: TimingSource,
-  active: boolean,
+): number | undefined {
+  for (let next = index + 1; next < run.length; next += 1) {
+    const classification = runChild(run[next]!.classification);
+    if (classification?.kind !== "assistant") continue;
+    return timings.timingFor(classification.timestamp)?.startedAt ?? classification.timestamp;
+  }
+  return undefined;
+}
+
+/**
+ * Whether a row draws any line of its own - before the fold takes something from
+ * it (`mask` undefined) or after (the kinds it leaves). Two cases hide nothing
+ * but draw nothing either: a message carrying only tool calls, and a step whose
+ * reasoning is the only thing left once `mask` takes the rest.
+ */
+function drawsRows(entry: ClassifiedChild, hidden: boolean, mask?: FoldMask): boolean {
+  if (hidden) return false;
+  const classification = runChild(entry.classification);
+  if (!classification) return false;
+  // Tool rows and custom cards always draw something of their own.
+  if (classification.kind !== "assistant") return true;
+  if (classification.hasNote) return true;
+  const keepsText = classification.hasText && mask?.text !== true;
+  const keepsThinking = classification.thinkingRuns > 0 && mask?.thinking !== true;
+  return keepsText || keepsThinking;
+}
+
+function summarizeStretch(
+  rows: readonly FoldedRow[],
+  startedAt: number | undefined,
+  endedAt: number | undefined,
+  live: boolean,
 ): RunSummary {
   const toolNames: string[] = [];
-  for (const entry of hidden) {
-    const classification = runChild(entry.classification);
-    if (classification?.kind === "tool") toolNames.push(classification.toolName ?? "tool");
-  }
-  // Reasoning counts whatever the fold takes off the screen: steps it takes
+  // Reasoning counts whatever this stretch takes off the screen: rows it takes
   // whole, and the reasoning it masks out of a row that stays. A row whose
-  // reasoning survives contributes nothing, and the two sets are disjoint, so
-  // nothing is counted twice.
+  // reasoning survives contributes nothing.
   let thinkingRuns = 0;
-  const countThinking = (entry: ClassifiedChild) => {
-    const classification = runChild(entry.classification);
-    if (classification?.kind === "assistant") thinkingRuns += classification.thinkingRuns;
-  };
-  for (const entry of hidden) countThinking(entry);
-  for (const entry of masked) {
-    if (entry.mask.thinking) countThinking(entry.entry);
+  for (const row of rows) {
+    const classification = runChild(row.entry.classification);
+    if (classification?.kind === "tool") {
+      if (row.hidden) toolNames.push(classification.toolName ?? "tool");
+      continue;
+    }
+    if (classification?.kind !== "assistant") continue;
+    if (row.hidden || row.mask?.thinking) thinkingRuns += classification.thinkingRuns;
   }
+  const durationMs =
+    startedAt !== undefined && endedAt !== undefined && Number.isFinite(startedAt) && Number.isFinite(endedAt)
+      ? Math.max(0, endedAt - startedAt)
+      : undefined;
   return {
     toolCount: toolNames.length,
     thinkingRuns,
     toolNames,
-    ...runTiming(run, timings, active),
+    ...(durationMs === undefined ? {} : { durationMs }),
+    live,
   };
 }
 
@@ -371,14 +421,15 @@ function foldRun(
   // Every finished step loses content: the whole row when all of its kinds
   // fold, or just the kinds that do. A row that keeps something renders in
   // place, so the fold never has to move content around.
-  const hidden: ClassifiedChild[] = [];
-  const masked: MaskedChild[] = [];
+  const folded: FoldedRow[] = [];
   run.forEach((entry, index) => {
     const classification = runChild(entry.classification);
     if (!classification || classification.kind === "decor") return;
     const isStep = index < visibleFrom;
     if (classification.kind === "tool") {
-      if (isStep && options.hideToolCalls) hidden.push(entry);
+      if (isStep && options.hideToolCalls) {
+        folded.push({ entry, index, hidden: true, renders: false, keepTrailing: false });
+      }
       return;
     }
     const keepsText = !isStep || !options.hideIntermediateText;
@@ -386,7 +437,7 @@ function foldRun(
     if (!keepsText && !keepsThinking) {
       // Nothing of this step survives the fold: fold it whole instead of
       // leaving an empty row behind.
-      hidden.push(entry);
+      folded.push({ entry, index, hidden: true, renders: false, keepTrailing: false });
       return;
     }
     // A mask only ever lists what the fold takes away: an empty one means the
@@ -399,26 +450,82 @@ function foldRun(
     // currently producing: the newest child, still without text of its own.
     const isTail = index === lastStep;
     if (mask.thinking && isTail && !classification.hasText) return;
-    masked.push({ entry, mask, keepTrailing: isTail });
+    folded.push({
+      entry,
+      index,
+      hidden: false,
+      mask,
+      renders: drawsRows(entry, false, mask),
+      keepTrailing: isTail,
+    });
   });
 
-  if (hidden.length === 0 && masked.length === 0) return;
+  if (folded.length === 0) return;
 
-  // One component renders the summary: the first thing the fold takes away. A
-  // run whose folded content all lives inside a message that stays visible
-  // prints the summary above that message.
-  const summary = summarizeRun(run, hidden, masked, timings, inFlight);
-  const host = hidden[0] ?? masked[0]?.entry;
-  for (const entry of hidden) {
-    layout.set(entry.component, entry === host ? { hidden: true, summary } : { hidden: true });
+  // A row that stays on screen splits the fold. Each stretch of consecutive
+  // folded rows gets its own summary, printed where that content used to be and
+  // counting only what it takes away: one summary per run would leave every
+  // stretch after the first without a trace, under a count that belongs to
+  // somewhere else on screen.
+  // Only a row that actually draws something ends a stretch - and that includes
+  // a row the fold merely masked: its paragraph is on screen either way, so the
+  // marks must not depend on whether the provider happened to return reasoning
+  // for that step.
+  const continues = (previous: FoldedRow, next: FoldedRow): boolean => {
+    if (next.renders) return false;
+    for (let index = previous.index + 1; index < next.index; index += 1) {
+      if (drawsRows(run[index]!, false)) return false;
+    }
+    return true;
+  };
+  const chunks: FoldedRow[][] = [];
+  for (const row of folded) {
+    const current = chunks[chunks.length - 1];
+    if (!current || !continues(current[current.length - 1]!, row)) chunks.push([row]);
+    else current.push(row);
   }
-  for (const watched of masked) {
-    layout.set(watched.entry.component, {
-      hidden: false,
-      mask: watched.mask,
-      keepTrailingReasoning: watched.keepTrailing,
-      ...(watched.entry === host ? { summary } : {}),
-    });
+
+  // A chunk that is nothing but a row the reader can see has no mark of its own:
+  // the content it folded is everything the row itself hides (its reasoning), and
+  // the mark it belongs to is the one below it - or, when there is none, the one
+  // above. The answer is the usual case: the run's last mark already sits right
+  // above it. Merging only ever happens between neighbours, so a mark never
+  // reaches across something the reader can see.
+  const stretches: FoldedRow[][] = [];
+  for (const chunk of chunks) {
+    const previous = stretches[stretches.length - 1];
+    const lone = chunk.length === 1 && chunk[0]!.renders;
+    if (lone && previous && previous[previous.length - 1]!.index === chunk[0]!.index - 1) {
+      previous.push(chunk[0]!);
+      continue;
+    }
+    stretches.push(chunk);
+  }
+
+  const runStart = runStartedAt(run, timings);
+  const runEnd = runEndedAt(run, timings, active);
+  let startedAt = runStart;
+  for (let start = 0; start < stretches.length; start += 1) {
+    const rows = stretches[start]!;
+    // Stretches tile the run: each one ends where the next visible message
+    // starts, and the last one ends where the run itself does (which is where it
+    // keeps its clock while the run is still in flight).
+    const isLast = start === stretches.length - 1;
+    const endedAt = isLast ? runEnd.endedAt : nextAssistantStart(run, rows[rows.length - 1]!.index, timings);
+    const summary = summarizeStretch(rows, startedAt, endedAt, isLast && runEnd.live);
+    // One component renders the summary: the first row the stretch takes away
+    // whole, or - when it takes content only - the first row it masks.
+    const host = rows.find((row) => row.hidden)?.entry ?? rows[0]!.entry;
+    for (const row of rows) {
+      const hosting = row.entry === host ? { summary } : {};
+      layout.set(
+        row.entry.component,
+        row.hidden
+          ? { hidden: true, ...hosting }
+          : { hidden: false, mask: row.mask, keepTrailingReasoning: row.keepTrailing, ...hosting },
+      );
+    }
+    startedAt = endedAt;
   }
 }
 

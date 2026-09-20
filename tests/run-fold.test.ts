@@ -222,7 +222,10 @@ test("a settled answer keeps its text and folds its reasoning into the summary",
   ])));
   try {
     const lines = plain(chat.render(70)).filter(Boolean);
+    // The answer's reasoning has no mark of its own: the run's last mark already
+    // sits right above the answer, so it takes that reasoning with it.
     assert.match(lines[0]!, /▸ read · 2 thinking · 9\.0s\s+\(f2 to expand\)/, "both reasoning runs count");
+    assert.doesNotMatch(lines.join("\n"), /▸ 1 thinking/, "the answer does not print a second mark");
     assert.match(lines.join("\n"), /答案是 bun test。/, "the answer text stays");
     assert.doesNotMatch(lines.join("\n"), /测试入口在 package\.json/, "the answer's reasoning is masked");
     assert.doesNotMatch(lines.join("\n"), /先看测试|让我看一下|file body/, "the steps stay folded");
@@ -473,6 +476,232 @@ test("masking text never takes the truncation note with it", () => {
     assert.doesNotMatch(rendered, /半截正文/, "the step's text is masked");
     assert.match(rendered, /想一想/, "its reasoning survives");
     assert.match(rendered, /Response was truncated before completion/, "the result row is not content");
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("every folded stretch between two visible steps gets its own summary", () => {
+  const chat = new Container();
+  const first = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "想",
+      text: "first narration",
+      tools: [{ id: "a", name: "read" }],
+      stopReason: "toolUse",
+    }),
+  );
+  // A step with no reasoning of its own has nothing to fold, so it stays on
+  // screen and ends the stretch above it.
+  const second = assistantComponent(
+    assistant({ timestamp: T0 + 3_000, text: "second narration", tools: [{ id: "b", name: "bash" }], stopReason: "toolUse" }),
+  );
+  const third = assistantComponent(
+    assistant({ timestamp: T0 + 6_000, text: "third narration", tools: [{ id: "c", name: "grep" }], stopReason: "toolUse" }),
+  );
+  const answer = assistantComponent(assistant({ timestamp: T0 + 9_000, text: "answer" }));
+  chat.addChild(first);
+  chat.addChild(toolComponent("a", "read", "body"));
+  chat.addChild(second);
+  chat.addChild(toolComponent("b", "bash", "body"));
+  chat.addChild(third);
+  chat.addChild(toolComponent("c", "grep", "body"));
+  chat.addChild(answer);
+
+  const timings = timingsSource(
+    new Map([
+      [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+      [T0 + 3_000, { startedAt: T0 + 3_500, completedAt: T0 + 4_000 }],
+      [T0 + 6_000, { startedAt: T0 + 6_500, completedAt: T0 + 7_000 }],
+      [T0 + 9_000, { startedAt: T0 + 9_500, completedAt: T0 + 12_000 }],
+    ]),
+  );
+  const layout = computeFoldLayout(chat.children, DEFAULT_RUN_FOLD_OPTIONS, timings);
+
+  assert.deepEqual(layout.get(first), {
+    hidden: false,
+    mask: { thinking: true },
+    keepTrailingReasoning: false,
+  });
+  assert.deepEqual(layout.get(second), undefined, "a step with nothing to fold stays native");
+  assert.deepEqual(layout.get(third), undefined);
+  assert.deepEqual(layout.get(answer), undefined);
+
+  // One summary per stretch, counting only what that stretch took away. The
+  // shells tile the run: each starts where the next visible message started and
+  // the last one ends where the run did.
+  assert.deepEqual(layout.get(chat.children[1]!)?.summary, {
+    toolCount: 1,
+    thinkingRuns: 1,
+    toolNames: ["read"],
+    durationMs: 3_500,
+    live: false,
+  });
+  assert.deepEqual(layout.get(chat.children[3]!)?.summary, {
+    toolCount: 1,
+    thinkingRuns: 0,
+    toolNames: ["bash"],
+    durationMs: 3_000,
+    live: false,
+  });
+  assert.deepEqual(layout.get(chat.children[5]!)?.summary, {
+    toolCount: 1,
+    thinkingRuns: 0,
+    toolNames: ["grep"],
+    durationMs: 5_500,
+    live: false,
+  });
+  assert.equal(layout.size, 4, "the masked step and the three folded tool rows");
+});
+
+test("the summaries land between the visible steps, not once at the top", () => {
+  const chat = new Container();
+  const first = assistantComponent(
+    assistant({ timestamp: T0, thinking: "想", text: "first narration", tools: [{ id: "a", name: "read" }], stopReason: "toolUse" }),
+  );
+  const second = assistantComponent(
+    assistant({ timestamp: T0 + 3_000, text: "second narration", tools: [{ id: "b", name: "bash" }], stopReason: "toolUse" }),
+  );
+  const answer = assistantComponent(assistant({ timestamp: T0 + 6_000, text: "answer" }));
+  chat.addChild(first);
+  chat.addChild(toolComponent("a", "read", "tool body one"));
+  chat.addChild(second);
+  chat.addChild(toolComponent("b", "bash", "tool body two"));
+  chat.addChild(answer);
+
+  const patch = installRunFoldPatch(DEFAULT_RUN_FOLD_OPTIONS);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 1_000 }]])));
+  try {
+    const lines = plain(chat.render(70)).filter((line) => line.trim() !== "");
+    const summaryRows = lines.filter((line) => line.includes("▸"));
+    assert.equal(summaryRows.length, 2, "one fold mark per stretch");
+    assert.match(summaryRows[0]!, /▸ read/);
+    assert.match(summaryRows[1]!, /▸ bash/);
+    assert.doesNotMatch(summaryRows.join("\n"), /×2/);
+    assert.deepEqual(
+      lines.map((line) => (line.includes("▸") ? "summary" : line.trim().startsWith("first") ? "first" : line.trim().startsWith("second") ? "second" : "other")),
+      ["first", "summary", "second", "summary", "other"],
+      "each summary sits where the content it folded used to be",
+    );
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("a row that renders nothing does not split a stretch", () => {
+  const chat = new Container();
+  const first = assistantComponent(
+    assistant({ timestamp: T0, thinking: "想", text: "narration", tools: [{ id: "a", name: "edit" }], stopReason: "toolUse" }),
+  );
+  // Pi draws a message whose only content is the tool call as zero rows: it is
+  // neither folded nor visible, so it cannot end the stretch around it.
+  const callOnly = assistantComponent(
+    assistant({ timestamp: T0 + 1_000, tools: [{ id: "b", name: "bash" }], stopReason: "toolUse" }),
+  );
+  const answer = assistantComponent(assistant({ timestamp: T0 + 2_000, text: "answer" }));
+  chat.addChild(first);
+  chat.addChild(toolComponent("a", "edit", "--- a"));
+  chat.addChild(callOnly);
+  chat.addChild(toolComponent("b", "bash", "ok"));
+  chat.addChild(answer);
+
+  const timings = timingsSource(
+    new Map([
+      [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+      [T0 + 1_000, { startedAt: T0 + 1_000, completedAt: T0 + 1_500 }],
+      [T0 + 2_000, { startedAt: T0 + 2_000, completedAt: T0 + 3_000 }],
+    ]),
+  );
+  const layout = computeFoldLayout(chat.children, DEFAULT_RUN_FOLD_OPTIONS, timings);
+
+  assert.equal(layout.get(callOnly), undefined, "the empty message keeps rendering natively");
+  assert.deepEqual(layout.get(chat.children[1]!)?.summary, {
+    toolCount: 2,
+    thinkingRuns: 1,
+    toolNames: ["edit", "bash"],
+    durationMs: 3_000,
+    live: false,
+  });
+  assert.equal(layout.get(chat.children[3]!)?.summary, undefined, "no second summary for the same stretch");
+  assert.equal(layout.size, 3, "the masked step and the two folded tool rows");
+
+  const patch = installRunFoldPatch(DEFAULT_RUN_FOLD_OPTIONS);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timings);
+  try {
+    const lines = plain(chat.render(70)).filter((line) => line.trim() !== "");
+    assert.equal(
+      lines.filter((line) => line.includes("▸")).length,
+      1,
+      "one fold mark, not two stacked with nothing in between",
+    );
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("a masked step that keeps its text ends the stretch above it", () => {
+  const chat = new Container();
+  const first = assistantComponent(
+    assistant({ timestamp: T0, thinking: "想", text: "first narration", tools: [{ id: "a", name: "read" }], stopReason: "toolUse" }),
+  );
+  const second = assistantComponent(
+    assistant({ timestamp: T0 + 3_000, thinking: "再想", text: "second narration", tools: [{ id: "b", name: "bash" }], stopReason: "toolUse" }),
+  );
+  const answer = assistantComponent(assistant({ timestamp: T0 + 6_000, text: "answer" }));
+  chat.addChild(first);
+  chat.addChild(toolComponent("a", "read", "tool body one"));
+  chat.addChild(second);
+  chat.addChild(toolComponent("b", "bash", "tool body two"));
+  chat.addChild(answer);
+
+  const timings = timingsSource(
+    new Map([
+      [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+      [T0 + 3_000, { startedAt: T0 + 4_000, completedAt: T0 + 5_000 }],
+      [T0 + 6_000, { startedAt: T0 + 7_000, completedAt: T0 + 8_000 }],
+    ]),
+  );
+  const layout = computeFoldLayout(chat.children, DEFAULT_RUN_FOLD_OPTIONS, timings);
+
+  // Both steps render their narration, so each one's folded reasoning and the
+  // tool row below it belong to their own mark. Whether the provider happened to
+  // return reasoning for a step must not move the marks: the reader sees the
+  // same paragraph either way.
+  assert.deepEqual(layout.get(chat.children[1]!)?.summary, {
+    toolCount: 1,
+    thinkingRuns: 1,
+    toolNames: ["read"],
+    durationMs: 4_000,
+    live: false,
+  });
+  assert.deepEqual(layout.get(chat.children[3]!)?.summary, {
+    toolCount: 1,
+    thinkingRuns: 1,
+    toolNames: ["bash"],
+    // The last mark runs to the end of the run, so the marks add up to the run's
+    // own clock instead of dropping whatever the answer spent streaming.
+    durationMs: 4_000,
+    live: false,
+  });
+
+  const patch = installRunFoldPatch(DEFAULT_RUN_FOLD_OPTIONS);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timings);
+  try {
+    const lines = plain(chat.render(70)).filter((line) => line.trim() !== "");
+    assert.deepEqual(
+      lines.map((line) =>
+        line.includes("▸") ? "summary" : line.trim().startsWith("first") ? "first" : line.trim().startsWith("second") ? "second" : "answer",
+      ),
+      ["first", "summary", "second", "summary", "answer"],
+      "each narration keeps its own mark under it",
+    );
   } finally {
     patch.dispose();
   }
