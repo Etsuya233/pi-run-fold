@@ -33,7 +33,8 @@ const FULL_REDRAW_CLEAR = "\x1b[2J\x1b[H\x1b[3J";
 
 /**
  * Folds every agent run down to its prompt, a one-line summary
- * (`▸ read ×2, bash · 2 thinking · 12.4s`), and the final answer.
+ * (`▸ read ×2, bash · 2 thinking · 12.4s`), and the final answer. While the run
+ * works, its newest step stays on screen as the live tail.
  *
  * Display only: messages, session entries, and model context are untouched.
  */
@@ -268,6 +269,16 @@ export default function (pi: ExtensionAPI) {
     assertRunFoldPatch();
     if (!runActive) setRunActive(true);
     startTicker();
+    refresh();
+  });
+
+  pi.on("message_update", (event, context) => {
+    if (event.message.role !== "assistant") return;
+    ctx = context;
+    // The layout now depends on the streaming message's content: its reasoning
+    // stops being the live tail - and folds away - the moment the same message
+    // emits text. Refreshing per update lands the mask on the same frame as the
+    // text instead of up to a tick later.
     refresh();
   });
 

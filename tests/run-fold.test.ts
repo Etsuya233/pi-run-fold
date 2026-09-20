@@ -149,13 +149,20 @@ test("runs are split by user prompts, banners, and other non-run children", () =
   assert.equal(layout.get(runTwoFinal), undefined);
 });
 
-test("a single answer run stays untouched and a settled run keeps its output", () => {
+test("a settled answer folds its reasoning and an answerless run keeps its output", () => {
   const chat = new Container();
   const only = assistantComponent(assistant({ timestamp: T0, thinking: "hmm", text: "answer" }));
   const trailingTool = toolComponent("t1", "read", "…");
   chat.addChild(only);
   chat.addChild(trailingTool);
-  assert.equal(computeFoldLayout(chat.children, options).size, 0);
+  // The run's only folded content is the reasoning inside its answer: the
+  // answer stays and hosts the summary, so the reasoning is never lost.
+  const layout = computeFoldLayout(chat.children, options);
+  const entry = layout.get(only);
+  assert.equal(entry?.hidden, false, "the answer stays visible");
+  assert.equal(entry?.stripThinking, true, "its reasoning folds into the summary");
+  assert.equal(entry?.summary?.thinkingRuns, 1);
+  assert.equal(layout.get(trailingTool), undefined, "a plain trailing tool is a boundary, not part of the run");
 
   // An aborted run leaves settled tool output behind: that output is the
   // result the user needs, so it is never folded away.
@@ -168,19 +175,177 @@ test("a single answer run stays untouched and a settled run keeps its output", (
   assert.equal(computeFoldLayout(aborted.children, options).size, 0);
 
   // While a tool is still running there is no answer yet, but the run is
-  // clearly in flight: fold its steps so the transcript does not keep growing.
+  // clearly in flight: its finished steps fold and the running tool - the live
+  // tail - stays on screen.
   const running = new Container();
+  const pending = new ToolExecutionComponent("read", "t", {}, {}, undefined, ui, "/local/workspace");
   running.addChild(intermediate);
-  running.addChild(new ToolExecutionComponent("read", "t", {}, {}, undefined, ui, "/local/workspace"));
+  running.addChild(pending);
   const live = computeFoldLayout(running.children, options, timingsSource(new Map([[T0, { startedAt: T0 }]])));
-  assert.deepEqual([...live.keys()], [intermediate, running.children[1]]);
+  assert.deepEqual([...live.keys()], [intermediate], "only the finished step is hidden");
   assert.deepEqual(live.get(intermediate)?.summary, {
-    toolCount: 1,
+    toolCount: 0,
     thinkingRuns: 0,
-    toolNames: ["read"],
+    toolNames: [],
     durationMs: 60_000,
     live: true,
   });
+});
+
+test("a settled answer keeps its text and folds its reasoning into the summary", () => {
+  const chat = new Container();
+  const first = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "先看测试",
+      text: "让我看一下。",
+      tools: [{ id: "t", name: "read" }],
+      stopReason: "toolUse",
+    }),
+  );
+  const final = assistantComponent(
+    assistant({ timestamp: T0 + 5_000, thinking: "测试入口在 package.json", text: "答案是 bun test。" }),
+  );
+  chat.addChild(first);
+  chat.addChild(toolComponent("t", "read", "file body"));
+  chat.addChild(final);
+
+  const patch = installRunFoldPatch({ ...options, expanded: false });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([
+    [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+    [T0 + 5_000, { startedAt: T0 + 5_000, completedAt: T0 + 9_000 }],
+  ])));
+  try {
+    const lines = plain(chat.render(70)).filter(Boolean);
+    assert.match(lines[0]!, /▸ read · 2 thinking · 9\.0s\s+\(f2 to expand\)/, "both reasoning runs count");
+    assert.match(lines.join("\n"), /答案是 bun test。/, "the answer text stays");
+    assert.doesNotMatch(lines.join("\n"), /测试入口在 package\.json/, "the answer's reasoning is masked");
+    assert.doesNotMatch(lines.join("\n"), /先看测试|让我看一下|file body/, "the steps stay folded");
+
+    patch.toggle(); // F2 brings the native rendering back, reasoning included
+    assert.match(plain(chat.render(70)).join("\n"), /测试入口在 package\.json/);
+    patch.toggle();
+    assert.doesNotMatch(plain(chat.render(70)).join("\n"), /测试入口在 package\.json/);
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("reasoning stays while it is the live tail and folds as soon as text arrives", () => {
+  const chat = new Container();
+  const first = assistantComponent(
+    assistant({ timestamp: T0, tools: [{ id: "t", name: "read" }], stopReason: "toolUse" }),
+  );
+  chat.addChild(first);
+  chat.addChild(toolComponent("t", "read", "file body"));
+  const answer = assistantComponent(assistant({ timestamp: T0 + 5_000, thinking: "正在推理" }));
+  chat.addChild(answer);
+
+  const patch = installRunFoldPatch({ ...options, expanded: false });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 1_000 }]])));
+  patch.setRunActive(true);
+  patch.refresh();
+  try {
+    // The reasoning is the newest activity: it is on screen, and the steps
+    // before it are already folded.
+    const live = plain(chat.render(70)).join("\n");
+    assert.match(live, /正在推理/);
+    assert.match(live, /▸ read · \d+s/, "the finished step is folded while the tail streams");
+
+    // The same message starts emitting text: the reasoning is history now.
+    answer.updateContent(assistant({ timestamp: T0 + 5_000, thinking: "正在推理", text: "答案来了" }), true);
+    patch.refresh();
+    const folded = plain(chat.render(70)).join("\n");
+    assert.match(folded, /答案来了/);
+    assert.doesNotMatch(folded, /正在推理/);
+    assert.match(folded, /1 thinking/, "the masked reasoning joins the summary");
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("reasoning of a visible step folds without leaving a blank row behind", () => {
+  const chat = new Container();
+  // With intermediate text shown, a thinking-then-tool message stays visible - 
+  // but its reasoning is history, and masking it would leave nothing behind.
+  const step = assistantComponent(
+    assistant({ timestamp: T0, thinking: "只有思考", tools: [{ id: "t", name: "read" }], stopReason: "toolUse" }),
+  );
+  chat.addChild(step);
+  chat.addChild(new ToolExecutionComponent("read", "t", {}, {}, undefined, ui, "/local/workspace"));
+
+  const patch = installRunFoldPatch({ ...options, expanded: false, hideIntermediateText: false });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
+  patch.setRunActive(true);
+  patch.refresh();
+  try {
+    const lines = plain(chat.render(70)).filter(Boolean);
+    assert.match(lines[0]!, /▸ 1 thinking · \d+s\s+\(f2 to expand\)/, "the step's reasoning is summarized");
+    assert.doesNotMatch(lines.join("\n"), /只有思考/);
+    assert.equal(
+      lines.filter((line) => line.includes("只有思考")).length,
+      0,
+      "the masked reasoning leaves no blank row where the message was",
+    );
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("reasoning wrapped for mouse handling is masked the same way", () => {
+  const chat = new Container();
+  const answer = assistantComponent(assistant({ timestamp: T0, thinking: "包起来的推理", text: "可见答案" }));
+  // Pi 0.85+ wraps each reasoning child in a MouseRegion; masking must work on
+  // the wrapper without changing the child count the layout mirror sees.
+  const content = (answer as unknown as { contentContainer: { children: unknown[] } }).contentContainer;
+  const reasoning = content.children[1] as { render(width: number): string[]; invalidate?(): void };
+  content.children[1] = {
+    child: reasoning,
+    render: (width: number) => reasoning.render(width),
+    invalidate: () => reasoning.invalidate?.(),
+  };
+  chat.addChild(answer);
+
+  const patch = installRunFoldPatch({ ...options, expanded: false });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
+  try {
+    const rendered = plain(chat.render(70)).join("\n");
+    assert.match(rendered, /可见答案/);
+    assert.doesNotMatch(rendered, /包起来的推理/);
+    assert.match(rendered, /1 thinking/);
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("an unrecognized message layout falls back to native rendering", () => {
+  const chat = new Container();
+  const answer = assistantComponent(assistant({ timestamp: T0, thinking: "推理内容", text: "答案内容" }));
+  const content = (answer as unknown as { contentContainer: { children: unknown[] } }).contentContainer;
+  // Simulate a Pi release that builds a layout this module does not know: the
+  // reasoning must stay visible instead of being mangled or hidden by mistake.
+  content.children.push({ render: () => ["unexpected"], invalidate() {} });
+  chat.addChild(answer);
+
+  const patch = installRunFoldPatch({ ...options, expanded: false });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 2_000 }]])));
+  try {
+    const rendered = plain(chat.render(70)).join("\n");
+    assert.match(rendered, /推理内容/);
+    assert.match(rendered, /答案内容/);
+  } finally {
+    patch.dispose();
+  }
 });
 
 test("expanded runs and strategy switches change what is folded", () => {
@@ -197,11 +362,12 @@ test("expanded runs and strategy switches change what is folded", () => {
     ...options,
     hideIntermediateText: false,
   }, timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 1_000 }]])));
-  assert.equal(toolsOnly.get(first), undefined, "narration stays visible");
-  assert.deepEqual([...toolsOnly.keys()], [chat.children[1]]);
+  assert.equal(toolsOnly.get(first)?.hidden, false, "narration stays visible");
+  assert.equal(toolsOnly.get(first)?.stripThinking, true, "its reasoning still folds");
+  assert.equal(toolsOnly.size, 2, "the tool folds and hosts the summary");
   assert.deepEqual(toolsOnly.get(chat.children[1]!)?.summary, {
     toolCount: 1,
-    thinkingRuns: 0,
+    thinkingRuns: 1,
     toolNames: ["read"],
     durationMs: 60_000,
     live: true,
@@ -247,17 +413,19 @@ test("summary text is compact and truncates to the render width", () => {
     60,
     theme,
   ));
-  assert.equal(wide.length, 1);
-  assert.match(wide[0]!, /^ ▸ read, bash, edit · 1 thinking · 4\.2s/);
-  assert.ok(stripVTControlCharacters(wide[0]!).length <= 60);
+  assert.equal(wide.length, 2, "the summary block keeps one blank line above it");
+  assert.equal(wide[0], "");
+  assert.match(wide[1]!, /^ ▸ read, bash, edit · 1 thinking · 4\.2s/);
+  assert.ok(stripVTControlCharacters(wide[1]!).length <= 60);
 
   const narrow = plain(renderRunSummaryLines(
     { toolCount: 3, thinkingRuns: 1, toolNames: ["read", "bash", "edit"], durationMs: 4_200, live: false },
     14,
     theme,
   ));
-  assert.ok(narrow[0]!.length <= 14);
-  assert.match(narrow[0]!, /…$/);
+  assert.equal(narrow.length, 2);
+  assert.ok(narrow[1]!.length <= 14);
+  assert.match(narrow[1]!, /…$/);
 });
 
 test("thinking runs count consecutive thinking blocks only", () => {
@@ -431,7 +599,10 @@ test("an aborted run expands again so its error output stays visible", async () 
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0 }]])));
   try {
-    assert.equal(plain(chat.render(70)).filter(Boolean).length, 1, "folded while the tool runs");
+    const live = plain(chat.render(70)).filter(Boolean);
+    assert.match(live[0]!, /▸ 1 thinking · \d+s\s+\(f2 to expand\)/, "the finished step folds into the summary");
+    assert.doesNotMatch(live.join("\n"), /先跑测试/, "the folded reasoning is gone");
+    assert.match(live.join("\n"), /\$/, "the running bash tool is the live tail");
 
     // Pi marks the pending tool as an error during abort recovery.
     running.updateResult({ content: [{ type: "text", text: "Aborted after 1 retry attempt" }], isError: true });
@@ -570,11 +741,11 @@ test("an in-flight run stays folded between a finished tool and the next message
   const timings = timingsSource(new Map([[T0, { startedAt: T0 - 1_000, completedAt: T0 + 2_000 }]]));
   assert.equal(computeFoldLayout(chat.children, options, timings).size, 0, "settled and answerless: visible");
   const active = computeFoldLayout(chat.children, options, timings, true);
-  assert.deepEqual([...active.keys()], [intermediate, tool], "in flight: the steps fold");
+  assert.deepEqual([...active.keys()], [intermediate], "in flight: the finished step folds, the tail stays");
   assert.deepEqual(active.get(intermediate)?.summary, {
-    toolCount: 1,
+    toolCount: 0,
     thinkingRuns: 1,
-    toolNames: ["read"],
+    toolNames: [],
     durationMs: 61_000,
     live: true,
   });
@@ -600,15 +771,17 @@ test("toggling in the tool-to-message gap folds immediately instead of waiting f
   patch.setRunActive(true);
   patch.refresh();
   try {
-    assert.match(plain(chat.render(70)).join("\n"), /▸ read · \d+s/, "folded while in flight");
+    assert.match(plain(chat.render(70)).join("\n"), /▸ \d+s\s+\(f2 to expand\)/, "folded while in flight");
+    assert.match(plain(chat.render(70)).join("\n"), /read/, "the finished tool is the live tail");
 
     patch.toggle(); // F2: expand
     assert.match(plain(chat.render(70)).join("\n"), /narration/, "expanded");
 
     patch.toggle(); // F2: fold again, with no pending child and no answer yet
     const folded = plain(chat.render(70)).filter(Boolean);
-    assert.equal(folded.length, 1, "the collapse takes effect right away");
-    assert.match(folded[0]!, /▸ read/);
+    assert.match(folded[0]!, /▸ \d+s\s+\(f2 to expand\)/, "the collapse takes effect right away");
+    assert.match(folded.join("\n"), /read/, "the newest step - the finished tool - stays as the tail");
+    assert.doesNotMatch(folded.join("\n"), /narration/, "the earlier step is folded");
 
     patch.setRunActive(false); // the run settled without an answer (abort): show the output
     const settled = plain(chat.render(70)).join("\n");
@@ -642,11 +815,12 @@ test("the run clock covers tool execution and the gaps between messages", () => 
   };
 
   // Message A1 ended after 3s; the tool then runs for a minute without a new
-  // message, so the clock must keep counting instead of freezing at 3.0s.
+  // message, so the clock must keep counting instead of freezing at 3.0s. The
+  // running tool is the live tail, so it is not counted as folded yet.
   assert.deepEqual(summaryAt(T0 + 30_000), {
-    toolCount: 1,
+    toolCount: 0,
     thinkingRuns: 0,
-    toolNames: ["bash"],
+    toolNames: [],
     durationMs: 30_000,
     live: true,
   });

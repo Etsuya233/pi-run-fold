@@ -2,17 +2,32 @@
 
 > Fold each agent run in Pi's TUI into one summary line. A run keeps its prompt
 > and its final answer; tool rows, tool output, intermediate assistant text, and
-> reasoning collapse into a single live line. `F2` expands everything again.
+> reasoning collapse into a single live line - while the run works, the newest
+> step (the running tool, the streaming text, or the reasoning being produced)
+> stays on screen as the live tail. `F2` expands everything again.
 > Display-only: no session entries, no message mutation, no model-context change.
 > *This document is written in Chinese because it is a design note; the extension
 > itself and its API are English.*
 
-一个 Pi 扩展原型：把**一个 agent run** 折叠成"用户输入 + 一行摘要 + 最终回答"。
+一个 Pi 扩展原型：把**一个 agent run** 折叠成"用户输入 + 一行摘要 + 最终回答"，
+运行期间只额外保留**最新的一步**当作实时尾部。
+
+运行中的样子（第 4 步 = 下一轮思考正在流式输出）：
 
 ```text
 > 读一下 package.json 再看 tests 目录
 
-  ▸ read, ls · 1 thinking · 6.3s  (f2 to expand)
+  ▸ read · 1 thinking · 2.1s  (f2 to expand)
+
+  测试入口是 bun test
+```
+
+run 结束后的样子：
+
+```text
+> 读一下 package.json 再看 tests 目录
+
+  ▸ read · 2 thinking · 6.3s  (f2 to expand)
 
   这是 bun 工作区，测试入口是 bun run test。
 ```
@@ -45,6 +60,7 @@ pi remove  ~/programming/run-fold
 | `/run-fold status` | 打印当前策略 |
 
 `/run-fold text off` 是"只有工具太吵"模式：中间叙述留下，工具行折成摘要那一行。
+两个模式都不显示中间步骤的思考：思考要么正在流式（实时尾部）、要么折进摘要的 `N thinking`。
 
 **为什么是 `F2`**：`ctrl+o`（工具展开）和 `ctrl+t`（thinking 展开）在 Pi 的
 `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` 里，扩展注册会被拒绝并告警；
@@ -65,7 +81,7 @@ backspace/tab/enter 的别名）。`f1`–`f12` 完全没有被 Pi 使用，所�
 | --- | --- | --- |
 | `pi.registerMessageRenderer(customType, …)` | 只对 `pi.sendMessage()` 产生的 `customType` 消息生效 | `core/extensions/loader.ts`（`registerMessageRenderer` 只写 `extension.messageRenderers`，`interactive-mode.ts` 只在 `role === "custom"` 时查表） |
 | `pi.registerEntryRenderer(customType, …)` | 只对 `pi.appendEntry()` 的自定义条目生效，且只能**新增**行，不能隐藏已有消息 | 同上 |
-| `pi.registerMarkdownTransformer(…)` | 只能改 markdown 文本，改不了组件、藏不掉整块 | `markdown-transform.ts` |
+| `pi.registerMarkdownTransformer(…)` | 只能改 markdown 文本；不过 thinking 块是独立渲染的 `Markdown`，**transform 返回 `""` 会让它整体 0 行**（`tui/src/components/markdown.ts:285`：先 transform、再判空返回 `[]`）。真实障碍是缓存：`Markdown.cachedLines` 的 key 是 `(text,width)`，不含 transform 结果，F2 切换后会吐旧结果 | `markdown-transform.ts`、`tui/src/components/markdown.ts` |
 | `ctx.ui.setToolsExpanded(false)` | 工具块收成"每工具 1 行"，不是合并成 1 行 | `interactive-mode.ts` |
 | `pi.on("context")` | 那是**发给模型**的上下文，与显示无关 | `core/agent-session.ts` |
 
@@ -90,6 +106,18 @@ backspace/tab/enter 的别名）。`f1`–`f12` 完全没有被 Pi 使用，所�
 
 所以选择"**只替换输出，不动结构**"：包装 `AssistantMessageComponent.prototype.render` 与
 `ToolExecutionComponent.prototype.render`，宿主结构一个字节都不改。
+
+同一条路还有一个更细的粒度：assistant 消息**内部**的思考块。它不是一个独立的消息组件，而是
+`contentContainer` 里的一个子组件（`assistant-message.ts:138-172`），所以藏不掉整条消息的时候，
+本扩展就**临时把那几个子组件的 `render` 换成 `() => []`**，再走消息自己的原生 render：
+
+- 只遮罩 `reasoning`（思考）子组件，答案文本照旧；
+- 先按 `updateContent()` 的布局镜像（前导 Spacer → 每个 text/thinking run → 思考后的条件 Spacer
+  → length/abort/error 尾行）算出下标，**数量对不上就不动手**（Pi 改布局只会丢掉这个特性，
+  不会把消息画错）；
+- 遮罩是渲染期临时的，`finally` 里还给原函数，所以 Pi 的 `Container.render` 仍会把这些子组件的
+  真实高度记进 `mouseLayout`（高度 0 与输出一致），鼠标命中不会错位；
+- 0.85+ 的 `MouseRegion` 包装层一并遮罩（镜像只看子组件个数，包装多少层都不影响）。
 
 #### 决策二：run 分组从「当前 transcript 的子节点」推导，而不是维护事件状态机
 
@@ -133,23 +161,34 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 一个 run 里只有一个组件负责渲染摘要，其余返回 `[]`。展开状态下布局表为空，摘要随之消失——
 因为渲染它的组件自己也不再被隐藏。
 
-#### 决策四：保留条件 = run 里最后一个「不含 toolCall 的 assistant」
+#### 决策四：实时尾部 + 「最终回答」
 
-这条一行规则覆盖了所有实际形态：
+两条规则叠加，覆盖所有实际形态：
 
 | 画面上的情形 | 分类结果 |
 | --- | --- |
-| `[A1(toolUse), T1, T2, A2(stop)]` | 藏 A1/T1/T2，保留 A2 |
-| `[A1(toolUse), T1]`（工具正在跑） | 还没有回答，但工具在跑 → **整个 run 折叠**，摘要显示计时 |
-| `[A1(toolUse), T1]`（工具已返回、下一条消息还没开始） | 没有东西 pending，但 agent 还在跑（`agent_start`→`agent_settled`）→ **保持折叠**，计时继续走 |
-| `[A1(toolUse), T1(错误)]`（abort 之后，`agent_settled` 已到） | 没有回答、run 也已结束 → **不折叠**，错误输出留给用户 |
-| `[A1(stop)]`（直接回答） | 没有可藏的东西 → 原生渲染，一行都不多 |
+| `[A1(stop)]`（直接回答、无思考） | 没有可藏的东西 → 原生渲染，一行都不多 |
+| `[A1(thinking), …]` 正在思考 | thinking 是实时尾部 → 原生渲染（你能看到它在想什么） |
+| `[A1(thinking, text)]` 开始出正文 | 思考折进摘要，正文留下 |
+| `[A1(toolUse), T1]`（工具正在跑） | A1 折成摘要行，**T1（正在跑的工具）是实时尾部，留在屏幕上** |
+| `[A1(toolUse), T1]`（工具已返回、下一条消息还没开始） | 上游 `agent_start`→`agent_settled` 仍是 in-flight → 已完成的 T1 继续当尾部，计时继续走 |
+| `[A1(toolUse), T1, T2, A2(stop)]`（run 结束） | 藏 A1/T1/T2，保留 A2，**并遮掉 A2 自己的思考**（它已经是历史，不再是最新活动） |
+| `[A1(stop, thinking only)]`（只思考、被 abort / settle） | 没有正文可留 → 思考原样保留（那是结果，不是过程） |
+| `[A1(toolUse), T1(错误)]`（abort 之后 `agent_settled` 已到） | 没有回答、run 也已结束 → **不折叠**，错误输出留给用户 |
 | auto-retry：`[A1(error), A2(stop)]` | 失败的尝试跟着步骤一起折进去（想要的效果） |
+
+"实时尾部" = `inFlight` 时 run 里最后一个非 decor 子节点；`inFlight` = `anyPending || active`
+（`computeFoldLayout()` 的 `active` 参数由 `index.ts` 的 `agent_start` / `agent_settled` 维护）。
+run 结算后尾部就是最后一条 "不含 toolCall 的 assistant"（决策四的老规则），此时任何仍可见的
+思考都会被遮罩。
+
+思考的"实时"判据是**消息内容级**的，不是状态机级的：一个 thinking run 只有在"它后面没有可见内容"
+且"这条消息是尾部"时才留在屏幕上。所以模型从思考切到正文的那一帧，思考就折了（`index.ts` 在
+`message_update` 上 `refresh()`，不必等下一秒的 tick）。
 
 "abort 之后不折叠"是刻意的：那时工具行里的错误文本就是用户要的结果，折成一个空摘要等于藏了它。
 反过来说，“工具返回但下一条消息还没开始”这个空档必须靠 run 级状态判定：只看子组件的 pending
-标志时它和 abort 长得一模一样，会让 `F2` 在这一瞬失效、并在下一条消息开始流式时突然自己折上
-（`computeFoldLayout()` 的 `active` 参数由 `index.ts` 的 `agent_start` / `agent_settled` 维护）。
+标志时它和 abort 长得一模一样，会让 `F2` 在这一瞬失效、并在下一条消息开始流式时突然自己折上。
 
 ### 2.3 不变量
 
@@ -163,7 +202,11 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 4. **可自愈。** 别的扩展在 `/reload` 时可能把 `prototype.render` 还原掉；本扩展在
    `session_start` 和每条 assistant `message_start` 上重新断言（`assertRunFoldPatch`）。
 5. **失败即退让。** 找不到组件类、找不到 chat container、分类抛异常，一律走原生渲染；
-   `AssistantMessageComponent.render` 不存在时直接自禁用并 `notify`。
+   `AssistantMessageComponent.render` 不存在时直接自禁用并 `notify`。思考遮罩同样：布局镜像与
+   实际子组件对不上（Pi 改了 `updateContent` 的构造顺序）就整条消息走原生渲染。
+6. **思考要么可见、要么计入摘要。** 被遮罩的 thinking run 会加进摘要的 `N thinking`，不会出现
+   "屏幕上没了、摘要里也没算"的静默丢失；反过来，只有思考、没有正文的尾部永远不会被遮罩
+   （否则那条消息会变成空白）。
 
 ### 2.4 计时
 
@@ -178,6 +221,10 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 run 的时长 = `第一个 assistant 的开始时刻 → run 结束`。run 还在飞时“结束”就是 `now`（所以工具
 时间计入、数字一直走），`agent_settled` 之后用最后一个 assistant 的完成时刻——两者连续，结算时
 不会跳变。展开状态不持久化。
+
+摘要里的 `toolCount` / `N thinking` 统计的是**已经被折掉的东西**：正作为实时尾部显示的那一步
+（正在跑的工具、正在流的思考）不算在内，等它折下去时才 +1。所以运行期间数字只增不减，且屏幕上
+看得见的东西不会被重复计入。
 
 ### 2.5 一条没走的路（以及为什么）
 
@@ -221,7 +268,9 @@ run 的时长 = `第一个 assistant 的开始时刻 → run 结束`。run 还�
 | `…/interactive-mode.ts:3225,3249,3284,3329,3372` | UI 侧对 `message_start/update/end`、`tool_execution_start`、`agent_end` 的处理 | 复刻了真实时序来压测（见 §4） |
 | `…/interactive-mode.ts:3584,3693,3893` | `addMessageToChat` / `renderSessionItems` / `renderInitialMessages` | children 的顺序与"重建"路径 |
 | `…/interactive-mode.ts:2193` | `setExtensionWidget`：widget 工厂能拿到 `TUI` | 零高度 widget 同时充当 `requestRender` 桥和 chat container 的发现入口 |
-| `components/assistant-message.ts:80,91` | `render` / `updateContent` | 被包装的方法；`lastMessage`、`isStreaming`、`hasToolCalls` 的来源 |
+| `components/assistant-message.ts:80,91` | `render` / `updateContent` | 被包装的方法；`lastMessage`、`isStreaming`、`hasToolCalls`、`hasText` 的来源 |
+| `components/assistant-message.ts:98,138-172` | `updateContent` 的子组件构造顺序（前导 Spacer / thinking run / 条件 Spacer / length·abort·error 尾行）；0.85+ 每个 thinking 子组件外层多一层 `MouseRegion` | 推理遮罩的布局镜像依据（`renderer.ts` 的 `reasoningChildIndexes`） |
+| `tui/src/components/markdown.ts:285` | `transform` 后判空 `return []` | 为什么 `registerMarkdownTransformer` 返回 `""` 也能藏掉 thinking 块（本项目仍选了子组件遮罩，因为 transform 结果不进 `Markdown` 的渲染缓存 key） |
 | `components/tool-execution.ts:254,259,401` | `render` 的 `hideComponent` 分支、`self` 外壳、空渲染判定 | 隐藏的可行性依据；没走官方路线的对照 |
 | `core/agent-session.ts:682` | `// Emit to extensions first` | **扩展事件早于组件创建**，所以不能在 `message_start` 里抓组件 |
 | `tui/src/tui.ts:319,344,366` | `Container` 的 `handleMouse` / `render` | 返回 `[]` 等于零高度零空行，鼠标自动落到邻居 |
@@ -284,8 +333,9 @@ streaming 组件并清 `pendingTools`。
 
 | 场景 | 结果 |
 | --- | --- |
-| 完整 run：正文流式 → toolCall 出现 → 工具跑 → 回答 | 正文出现后于 toolCall 到达时收拢（整个 run 唯一一次"变矮"）；工具输出全程不落地；最终回答保留 |
+| 完整 run：思考流式 → 正文 → toolCall → 工具跑 → 下一轮思考 → 回答 | 思考先以实时尾部显示；正文一到就折进摘要；toolCall 到达时 A1 整体收拢、**正在跑的工具行接管尾部**；工具输出可见但不落地为历史；下一轮思考再次成为尾部；run 结算后只剩摘要 + 回答 |
 | 工具跑到一半 abort | 工具被标错误后**自动展开**，错误文本可见 |
+| 回答自带思考（本轮修的）：`思考 → 正文` | 思考不再卡在最后（`...-Thinking-Text`），正文照旧；思考计入摘要的 `N thinking` |
 | `/compact` 后 `clear()` + 从 entries 重建 | **自动重新折叠**，计时取自 `entry.timestamp` |
 | steer（流式中插话） | 摘要位置不动；插话成为新的 run 边界 |
 | `session_shutdown` | 补丁卸载，transcript 完全恢复原生渲染 |
@@ -304,9 +354,10 @@ folded + refresh() every frame   2.09 ms/frame     ← 最坏情况；实际每�
 
 ### 4.3 测试
 
-18 个测试覆盖：run 分组与边界、live/settled/空档（tool 已返回但下一条消息未开始）的布局、
-run 级 ticker 与时长、摘要格式化与按宽截断、prototype 包装与还原、外来补丁后的自愈、abort
-后展开、transcript 重建、container 发现、offscreen 重绘（假 terminal + 真 `TuiMainScreen` +
+23 个测试覆盖：run 分组与边界、实时尾部（工具在手 / 工具已返回的空档 / 思考流式）、
+推理遮罩（答案自带思考、思考切正文、`MouseRegion` 包装层、布局不识别时退回原生）、
+run 级 ticker 与时长、摘要格式化与按宽截断、prototype 包装与还原、外来补丁后的自愈、
+abort 后展开、transcript 重建、container 发现、offscreen 重绘（假 terminal + 真 `TuiMainScreen` +
 模拟 preserve-scrollback 状态）、扩展完整生命周期。
 测试用**真实的 Pi 组件**（`AssistantMessageComponent` / `ToolExecutionComponent` /
 `UserMessageComponent`）和假的 TUI/ctx 断言渲染出来的行。
@@ -316,8 +367,8 @@ run 级 ticker 与时长、摘要格式化与按宽截断、prototype 包装与�
 | Pi 版本 | 怎么验的 | 结果 |
 | --- | --- | --- |
 | 0.83.0 | 还在 `pi-extensions` 工作区里时跑的全套单测 + headless 回放 | 通过 |
-| 0.84.4 | 本目录独立安装后跑 `bun run check` + headless 回放 | 18/18 通过 |
-| 0.85.1 | 修复前临时 `bun add -d …@0.85.1` 后跑 `bun run lint` + 测试 | 13/13 通过（本轮修复未在该版本复验） |
+| 0.84.4 | 本目录独立安装后跑 `bun run check` + headless 回放 + 上面的逐帧回放 | 23/23 通过 |
+| 0.85.1 / 0.86.1 | 对照 `reference/pi` 与 npm 上 0.86.1 的 `assistant-message.js` / `markdown.ts` 逐行核对布局镜像（带 `MouseRegion`、同顺序的 Spacer） | 布局一致；未在该版本跑测试 |
 | 任何版本 | `pi -e ~/programming/run-fold/index.ts --print "reply ok"` | 宿主加载成功（非 TUI 模式按设计不生效） |
 
 跨版本踩到的一个真实差异：**`TUI` 从 0.84 起不再由 `@earendil-works/pi-coding-agent`
@@ -342,6 +393,9 @@ bun install   # 回到 ^0.84.3
   显示折叠后的样子（见下一条）。
 - **还没产出回答就被打断的 run 保留输出。** abort、或回答生成前被 steer 打断时，工具行与
   错误文本留给你看，不会折成一个空摘要。见 §2.2 决策四。
+- **run 运行期间 transcript 会一涨一缩。** 实时尾部意味着每出现一步就多几行、下一步开始时再
+  收回去；regular 模式下这些变矮会走 clear-on-shrink（见下一条）。fullscreen 模式里 transcript
+  是 ScrollView，原地重排，没有这个问题——如果你在意实时尾部的观感，`--tui-mode fullscreen`。
 - **视口以上的轮次需要整屏重绘才能改。** regular 模式下已经打印过的行属于终端 scrollback，
   Pi 只能走 clear-on-shrink（清屏 + `\x1b[3J` 清 scrollback + 重写整条 transcript，
   `tui-main-screen.ts:357,451`）。于是：
@@ -398,6 +452,10 @@ pi -e ~/programming/run-fold/index.ts --print "reply with the single word ok"
 2. **摘要内容扩展**：tokens/花费（`message.usage`）、错误标记、文件改动计数、工具失败高亮。
 3. **可选工具层**：按 §2.5 走官方 `registerTool` 覆盖 + `renderShell: "self"`，把"工具块隐藏"
    变成配置项；必须同时抄 pi-tool-display 的 ownership 发现与 `/reload` 清理。
-4. **配置持久化**：接 `@99percentpeople/pi-shared-settings`（或独立 JSON），把策略与快捷键写盘。
-5. **上游化**：Pi 若提供 transcript 渲染钩子，这套 patch 可以整体退化成钩子里的一次过滤
+4. **配置持久化**：接 `@99percentpeople/pi-shared-settings`（或独立 JSON），把策略与快捷键写盘；
+   顺便把两个新行为做成开关：`tail on|off`（实时尾部）、`思考是否也遮罩`。
+5. **遮罩改走官方 API**：`pi.registerMarkdownTransformer` 在折叠时对 `assistant-thinking` 返回 `""`
+   （`markdown.ts:285` 会直接 `return []`）。代码更短，但要额外处理 `Markdown` 的渲染缓存
+   （transform 结果不在 cache key 里）和 Pi 自加的空 Spacer 行；当前选择子组件遮罩就是为了绕开这两点。
+6. **上游化**：Pi 若提供 transcript 渲染钩子，这套 patch 可以整体退化成钩子里的一次过滤
    （`computeFoldLayout()` 已经是纯函数，与 patch 层解耦）。

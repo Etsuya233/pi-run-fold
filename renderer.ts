@@ -12,12 +12,19 @@ import { Container, truncateToWidth, type Component } from "@earendil-works/pi-t
  *     ▸ read ×2, bash · 2 thinking · 12.4s  (f2 to expand)
  *     final answer
  *
+ * While the run is in flight the newest step (the running tool, the streaming
+ * text, or the reasoning being produced) stays on screen as the live tail;
+ * once it settles only the answer survives, with the reasoning inside it masked
+ * to zero rows.
+ *
  * Pi gives extensions no transcript hook, so this module wraps the two
  * component classes that make up a run (`AssistantMessageComponent` and
  * `ToolExecutionComponent`) and replaces their rendered output. It never
  * changes messages, session entries, or model context, and it never inserts or
  * removes children from Pi's chat container, so Pi's own bookkeeping (child
  * order, mouse layout, `pendingTools`, `streamingComponent`) stays intact.
+ * Reasoning is masked by temporarily replacing the `render` of the message's
+ * own thinking children while the message renders normally underneath.
  */
 
 export const DEFAULT_RUN_FOLD_TOGGLE_KEY = "f2";
@@ -60,6 +67,8 @@ export type RunChildClassification =
       thinkingRuns: number;
       /** No tool call yet: this message is (so far) the run's answer. */
       answerLike: boolean;
+      /** The message carries text, so folding its reasoning still leaves content. */
+      hasText: boolean;
       /** Still streaming, or a provider that reports a pending stop reason. */
       pending: boolean;
     }
@@ -86,8 +95,23 @@ export interface RunSummary {
 
 export interface FoldEntry {
   hidden: boolean;
-  /** Only set on the first hidden child of a run: it renders the summary line. */
+  /**
+   * Set on the first folded child of a run: it renders the summary block. That
+   * child is usually hidden, but a run whose only folded content is the
+   * reasoning inside its answer keeps the answer visible and renders the
+   * summary above it.
+   */
   summary?: RunSummary;
+  /**
+   * Render natively, but mask this message's reasoning runs to zero rows. The
+   * summary (when this component hosts it) is rendered above the message.
+   */
+  stripThinking?: boolean;
+  /**
+   * Keep a reasoning run that nothing visible follows: it is what the run is
+   * producing right now (or, when settled, the only thing the message says).
+   */
+  keepTrailingReasoning?: boolean;
 }
 
 interface ClassifiedChild {
@@ -95,15 +119,22 @@ interface ClassifiedChild {
   classification: FoldClassification;
 }
 
+interface AssistantContentBlock {
+  type?: string;
+  thinking?: string;
+  text?: string;
+}
+
 interface AssistantMessageLike {
   stopReason?: string;
   timestamp?: number;
-  content?: Array<{ type?: string; thinking?: string }>;
+  content?: AssistantContentBlock[];
 }
 
 interface AssistantInternals {
   isStreaming?: boolean;
   lastMessage?: AssistantMessageLike;
+  contentContainer?: { children?: Component[] };
 }
 
 interface ToolInternals {
@@ -159,6 +190,12 @@ function hasToolCalls(value: unknown): boolean {
   return Array.isArray(content) && content.some((block) => block?.type === "toolCall");
 }
 
+/** Does the message render any text of its own? */
+function hasText(value: unknown): boolean {
+  const content = messageOf(value)?.content;
+  return Array.isArray(content) && content.some((block) => block?.type === "text" && (block.text ?? "").trim());
+}
+
 /**
  * A tool row is still running while it has no result, or is streaming a partial
  * result. While it runs, its run can be folded even though no answer exists yet.
@@ -183,6 +220,7 @@ export function classifyRunChild(component: Component): FoldClassification {
       timestamp: message?.timestamp,
       thinkingRuns: countThinkingRuns(component),
       answerLike: !hasToolCalls(component),
+      hasText: hasText(component),
       pending: internals.isStreaming === true || message?.stopReason === "pending",
     };
   }
@@ -236,14 +274,21 @@ function runTiming(
 function summarizeRun(
   run: readonly ClassifiedChild[],
   hidden: readonly ClassifiedChild[],
+  stripped: readonly ClassifiedChild[],
   timings: TimingSource,
   active: boolean,
 ): RunSummary {
   const toolNames: string[] = [];
-  let thinkingRuns = 0;
   for (const entry of hidden) {
     const classification = runChild(entry.classification);
     if (classification?.kind === "tool") toolNames.push(classification.toolName ?? "tool");
+  }
+  // Reasoning counts whatever the fold takes off the screen: hidden steps and
+  // the reasoning masked out of a still-visible answer. The two sets are
+  // disjoint, so nothing is counted twice.
+  let thinkingRuns = 0;
+  for (const entry of [...hidden, ...stripped]) {
+    const classification = runChild(entry.classification);
     if (classification?.kind === "assistant") thinkingRuns += classification.thinkingRuns;
   }
   return {
@@ -254,6 +299,17 @@ function summarizeRun(
   };
 }
 
+/**
+ * Fold a run down to its summary block plus the one thing still worth watching:
+ *
+ * - While the run is in flight the newest child stays on screen, so you see the
+ *   tool that is running, the text that is streaming, or the reasoning that is
+ *   being produced - without the transcript growing with every step.
+ * - Once the run settles only its answer survives: every step folds, and the
+ *   reasoning inside the answer folds with them, because by then it is history
+ *   rather than activity. A settled run without an answer (aborted or failed)
+ *   keeps its content: that output is the result.
+ */
 function foldRun(
   run: readonly ClassifiedChild[],
   layout: Map<Component, FoldEntry>,
@@ -262,38 +318,66 @@ function foldRun(
   active: boolean,
 ): void {
   let lastAnswer = -1;
+  let lastStep = -1;
   let anyPending = false;
   run.forEach((entry, index) => {
     const classification = runChild(entry.classification);
     if (!classification) return;
+    if (classification.kind !== "decor") lastStep = index;
     if (classification.kind === "assistant" && classification.answerLike) lastAnswer = index;
     if (classification.kind !== "decor" && classification.pending) anyPending = true;
   });
 
-  // Children before the run's answer are its intermediate steps. While a run is
-  // still working (a tool is running, an answer is streaming, or the agent is
-  // between two messages of the same run) and no answer exists yet, every child
-  // is intermediate. A settled run without an answer (aborted or failed) keeps
-  // its content visible: that output is the result.
-  let candidates: ClassifiedChild[];
-  if (lastAnswer >= 0) candidates = run.slice(0, lastAnswer);
-  else if (anyPending || active) candidates = [...run];
+  const inFlight = active || anyPending;
+  // Everything before this index is a step the run has already finished.
+  let visibleFrom: number;
+  if (inFlight) visibleFrom = lastStep;
+  else if (lastAnswer >= 0) visibleFrom = lastAnswer;
   else return;
+  if (visibleFrom < 0) return;
 
   const hidden: ClassifiedChild[] = [];
-  for (const entry of candidates) {
+  for (const entry of run.slice(0, visibleFrom)) {
     const classification = runChild(entry.classification);
     if (!classification || classification.kind === "decor") continue;
     if (classification.kind === "assistant" && !options.hideIntermediateText) continue;
     if (classification.kind === "tool" && !options.hideTools) continue;
     hidden.push(entry);
   }
-  if (hidden.length === 0) return;
 
-  const summary = summarizeRun(run, hidden, timings, active);
-  hidden.forEach((entry, index) => {
-    layout.set(entry.component, index === 0 ? { hidden: true, summary } : { hidden: true });
+  // Reasoning is the run's live activity only while it is what the run is
+  // currently producing: the newest child, still without text of its own. Once
+  // the same message emits text - or the message stops being the tail because a
+  // newer step arrived - its reasoning belongs to the steps and folds away.
+  const stripped: Array<{ entry: ClassifiedChild; keepTrailing: boolean }> = [];
+  const foldedAway = new Set(hidden.map((entry) => entry.component));
+  run.forEach((entry, index) => {
+    const classification = runChild(entry.classification);
+    if (classification?.kind !== "assistant" || classification.thinkingRuns === 0) return;
+    if (foldedAway.has(entry.component)) return; // hidden entirely: nothing to mask
+    const isTail = index === lastStep;
+    if (isTail && !classification.hasText) return; // live reasoning preview
+    stripped.push({ entry, keepTrailing: isTail });
   });
+
+  if (hidden.length === 0 && stripped.length === 0) return;
+
+  // One component renders the summary: the first thing the fold takes away. A
+  // run whose only folded content is reasoning inside its answer keeps that
+  // answer visible and prints the summary above it.
+  const summary = summarizeRun(run, hidden, stripped.map((watched) => watched.entry), timings, inFlight);
+  const host = hidden[0] ?? stripped[0]?.entry;
+  for (const entry of hidden) {
+    layout.set(entry.component, entry === host ? { hidden: true, summary } : { hidden: true });
+  }
+  for (const watched of stripped) {
+    layout.set(watched.entry.component, {
+      hidden: false,
+      stripThinking: true,
+      keepTrailingReasoning: watched.keepTrailing,
+      ...(watched.entry === host ? { summary } : {}),
+    });
+  }
 }
 
 /**
@@ -366,6 +450,13 @@ export function formatRunSummary(summary: RunSummary, toggleKey = DEFAULT_RUN_FO
   return `▸ ${summaryBody(summary)}  (${toggleKey} to expand)`;
 }
 
+/**
+ * The summary block, as it appears in the transcript: one blank line, then the
+ * summary row. The blank line restores the spacing Pi gets from the leading
+ * `Spacer(1)` of the assistant message we hide: a run follows the user prompt,
+ * whose background box has a full row of background below the text, so the
+ * summary would otherwise sit flush against that background block.
+ */
 export function renderRunSummaryLines(
   summary: RunSummary,
   width: number,
@@ -382,7 +473,7 @@ export function renderRunSummaryLines(
     "  ",
     paint("muted", `(${toggleKey} to expand)`),
   ].join("");
-  return [" ".repeat(pad) + truncateToWidth(line, available, "…")];
+  return ["", " ".repeat(pad) + truncateToWidth(line, available, "…")];
 }
 
 const PATCH_SYMBOL = Symbol.for("@99percentpeople/pi-run-fold/render-patch");
@@ -476,15 +567,129 @@ function renderFolded(
     return native.call(component, width);
   }
   if (!entry) return native.call(component, width);
-  if (!entry.hidden) return native.call(component, width);
-  if (!entry.summary) return [];
-  return renderRunSummaryLines(
-    entry.summary,
-    width,
-    record.theme,
-    record.toggleKey,
-    outputPadOf(component),
-  );
+  if (entry.hidden) {
+    if (!entry.summary) return [];
+    return renderRunSummaryLines(
+      entry.summary,
+      width,
+      record.theme,
+      record.toggleKey,
+      outputPadOf(component),
+    );
+  }
+  if (!entry.stripThinking) return native.call(component, width);
+  const lines = renderWithoutThinking(component, width, native, entry.keepTrailingReasoning === true);
+  if (!entry.summary) return lines;
+  return [
+    ...renderRunSummaryLines(entry.summary, width, record.theme, record.toggleKey, outputPadOf(component)),
+    ...lines,
+  ];
+}
+
+/**
+ * Pi's `AssistantMessageComponent.updateContent()` builds its content container
+ * as: a leading spacer, one child per text block, one child per run of thinking
+ * blocks (plus a spacer when visible content follows), and finally the
+ * truncation/abort/error note. Mirroring that layout points at the reasoning
+ * children without matching colors or private markdown text - and a mismatch
+ * (Pi changed the layout) disables the mask instead of mangling the message.
+ *
+ * Returns the child indexes to mask, or an empty set when the layout is not the
+ * one this module knows how to read.
+ */
+function reasoningChildIndexes(
+  message: AssistantMessageLike,
+  children: readonly Component[],
+  keepTrailing: boolean,
+): Set<number> {
+  const content = message.content;
+  if (!Array.isArray(content)) return new Set();
+
+  const visible = (block: AssistantContentBlock | undefined) =>
+    (block?.type === "text" && (block.text ?? "").trim()) ||
+    (block?.type === "thinking" && (block.thinking ?? "").trim());
+  const kinds: Array<"spacer" | "content" | "reasoning"> = [];
+  if (content.some(visible)) kinds.push("spacer");
+  for (let index = 0; index < content.length; index++) {
+    const block = content[index];
+    if (block?.type === "text" && (block.text ?? "").trim()) {
+      kinds.push("content");
+    } else if (block?.type === "thinking") {
+      let hasReasoning = false;
+      for (; index < content.length; index++) {
+        const next = content[index];
+        if (next?.type !== "thinking") break;
+        if ((next.thinking ?? "").trim()) hasReasoning = true;
+      }
+      index--;
+      if (!hasReasoning) continue;
+      kinds.push("reasoning");
+      // Pi separates a reasoning run from the visible content that follows it.
+      if (content.slice(index + 1).some(visible)) kinds.push("spacer");
+    }
+  }
+  const hasToolCalls = content.some((block) => block?.type === "toolCall");
+  if (message.stopReason === "length") kinds.push("spacer", "content");
+  else if (!hasToolCalls && (message.stopReason === "aborted" || message.stopReason === "error")) {
+    kinds.push("spacer", "content");
+  }
+
+  if (kinds.length !== children.length) return new Set();
+  const masked = new Set<number>();
+  kinds.forEach((kind, index) => {
+    if (kind !== "reasoning") return;
+    // A run nothing visible follows is the newest thing the message says, so it
+    // is the live activity while this message is the run's tail.
+    const trailing = !kinds.slice(index + 1).some((later) => later !== "spacer");
+    if (keepTrailing && trailing) return;
+    masked.add(index);
+    if (kinds[index + 1] === "spacer") masked.add(index + 1);
+  });
+
+  // With every reasoning run gone and no text of its own, the message would
+  // still leave its leading spacer behind as a blank row. Mask that too.
+  const hasText = content.some((block) => block?.type === "text" && (block.text ?? "").trim());
+  if (!hasText && masked.size > 0 && kinds[0] === "spacer") masked.add(0);
+  return masked;
+}
+
+/**
+ * Render an assistant message with its reasoning masked to zero rows. The mask
+ * is a temporary `render` override on those children while the message's real
+ * render runs underneath, so Pi's own container bookkeeping (child heights, the
+ * mouse layout, the OSC 133 marks) still matches what reaches the terminal.
+ */
+function renderWithoutThinking(
+  component: Component,
+  width: number,
+  native: RenderFn,
+  keepTrailing: boolean,
+): string[] {
+  const internals = component as AssistantInternals;
+  const children = internals.contentContainer?.children;
+  const message = internals.lastMessage;
+  if (!children || !message) return native.call(component, width);
+  const masked = reasoningChildIndexes(message, children, keepTrailing);
+  if (masked.size === 0) return native.call(component, width);
+
+  const saved = new Map<Component, { own: boolean; render: RenderFn }>();
+  for (const index of masked) {
+    const child = children[index];
+    if (!child || typeof child.render !== "function") continue;
+    saved.set(child, {
+      own: Object.prototype.hasOwnProperty.call(child, "render"),
+      render: child.render,
+    });
+    child.render = () => [];
+  }
+  try {
+    return native.call(component, width);
+  } finally {
+    for (const [child, previous] of saved) {
+      if (previous.own) child.render = previous.render;
+      else delete (child as { render?: RenderFn }).render;
+    }
+  }
 }
 
 function createPatchRecord(options: Partial<RunFoldOptions>): PatchRecord {
