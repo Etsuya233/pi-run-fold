@@ -246,8 +246,8 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
 | `[A1(toolUse), T1]`（工具已返回、下一条消息还没开始） | 上游 `agent_start`→`agent_settled` 仍是 in-flight → 已完成的 T1 继续当尾部，计时继续走 |
 | `[A1(toolUse), T1, T2, A2(stop)]`（run 结束） | 藏 A1/T1/T2，保留 A2，**并遮掉 A2 自己的思考**（它已经是历史，不再是最新活动） |
 | `[A1(stop, thinking only)]`（只思考、被 abort / settle） | 没有正文可留 → 思考原样保留（那是结果，不是过程） |
-| `[A1(toolUse), T1(错误)]`（abort 之后 `agent_settled` 已到） | 没有回答、run 也已结束 → **不折叠**，错误输出留给用户 |
-| 同上，但后面又接了新 prompt | run 变成“被边界截断”，但它是**失败收尾**的 → 仍然**不折叠** |
+| `[A1(toolUse), T1(错误)]`（abort 之后 `agent_settled` 已到） | 没有回答、run 也已结束，而它还是转录的末尾 → **不折叠**，错误输出留给用户 |
+| 同上，但后面又接了新 prompt | run 变成“被边界截断”：步骤（含 A1 的思考）**折成摘要**，只留它失败的那一行（T1 的错误文本） |
 | steer：`[A1(toolUse), T1, <用户消息>, A2(stop)]` | 边界截住了它、而它既没有回答也没失败 → A1/T1 **折成摘要**，用户消息留在 Pi 放它的位置 |
 | auto-retry：`[A1(error), A2(stop)]` | 失败的尝试跟着步骤一起折进去（想要的效果） |
 
@@ -260,14 +260,22 @@ run 结算后尾部就是最后一条 "不含 toolCall 的 assistant"（决策�
 且"这条消息是尾部"时才留在屏幕上。所以模型从思考切到正文的那一帧，思考就折了（`index.ts` 在
 `message_update` 上 `refresh()`，不必等下一秒的 tick）。
 
-"abort 之后不折叠"是刻意的：那时工具行里的错误文本就是用户要的结果，折成一个空摘要等于藏了它。
-于是“没有回答的 run”要分两种：**失败**（abort / error / 最后一行工具报错）保留输出，**被边界截断**
-（steer、follow-up、banner、compaction summary 来了）则按普通 run 折叠——它没有回答只是因为回答被
-用户下一句话接走了，不是因为它留下了结果。被截断的 run 连“最新一步”也不再算实时尾部（`isTail` 只在
-run 还没结束时成立），它最后的 thinking 一样折进摘要。判据是 run 里**最后一个非 decor 子节点**：只有
-它失败才算这个 run 是失败收尾的（中途某个工具报错不影响）。
+"abort 之后把错误行留下"是刻意的：那时工具行里的错误文本就是用户要的结果，折成一个空摘要等于藏了它。
+于是“没有回答的 run”分成两种。**停在转录末尾**（`agent_settled` 到了、后面再没动静）时整段保留——它
+没有回答也没有下文，屏幕上留下的东西就是这段 run 的全部结果。**被边界截断**（steer、follow-up、banner、
+compaction summary 来了）时，它没有回答只是回答被用户下一句话接走了，于是步骤按普通 run 折叠；唯一
+留下的是它**失败收尾**的那一行（`abort` / `error` / 最后一行工具报错），错误文本仍然留给用户。被截断
+的 run 连“最新一步”也不再算实时尾部（`isTail` 只在 run 还没结束时成立），它最后的 thinking 一样折进
+摘要。判据是 run 里**最后一个非 decor 子节点**：只有它失败才算这个 run 是失败收尾的（中途某个工具报错
+不影响）。
 反过来说，“工具返回但下一条消息还没开始”这个空档必须靠 run 级状态判定：只看子组件的 pending
 标志时它和 abort 长得一模一样，会让 `F2` 在这一瞬失效、并在下一条消息开始流式时突然自己折上。
+
+那“失败的那一行”总是有东西可看的：Pi 在 `message_end` 上碰上 `aborted` / `error` 时，会把当时还在跑的
+每个工具行标成错误并写入 abort 原因（`interactive-mode.ts`，`Operation aborted` 或
+`Aborted after N retry attempt`）；带 toolCall 的消息在流式时就已建好这些工具行，所以它们一定排在那条
+消息后面，折叠留下的就是这行红字。abort 落在一个不带 toolCall 的消息上时，Pi 自己会画
+`Operation aborted` / `Error: …` 尾行（`assistant-message.ts`），那行同样不会被折。
 
 ### 2.3 不变量
 
@@ -440,7 +448,7 @@ streaming 组件并清 `pendingTools`。下表同样按三类全折的策略描�
 | 场景 | 结果 |
 | --- | --- |
 | 完整 run：思考流式 → 正文 → toolCall → 工具跑 → 下一轮思考 → 回答 | 思考先以实时尾部显示；正文一到就折进摘要；toolCall 到达时 A1 整体收拢、**正在跑的工具行接管尾部**；工具输出可见但不落地为历史；下一轮思考再次成为尾部；run 结算后只剩摘要 + 回答 |
-| 工具跑到一半 abort | 工具被标错误后**自动展开**，错误文本可见 |
+| 工具跑到一半 abort | 工具被标错误后**自动展开**，错误文本可见；再发一句新 prompt 之后它折进摘要，只留那行错误文本 |
 | 回答自带思考（本轮修的）：`思考 → 正文` | 思考不再卡在最后（`...-Thinking-Text`），正文照旧；思考计入摘要的 `N thinking` |
 | `/compact` 后 `clear()` + 从 entries 重建 | **自动重新折叠**，计时取自 `entry.timestamp` |
 | steer（流式中插话） | 摘要位置不动；插话成为新的 run 边界，被截断的那一段没有回答也没失败 → **折成摘要** |
@@ -460,7 +468,7 @@ folded + refresh() every frame   2.09 ms/frame     ← 最坏情况；实际每�
 
 ### 4.3 测试
 
-39 个测试覆盖：run 分组与边界、被 steer 截断的 run（vs 失败收尾的 run）、实时尾部（工具在手 /
+40 个测试覆盖：run 分组与边界、被 steer 截断的 run（vs 失败收尾的 run，含只留失败行的那条路径）、实时尾部（工具在手 /
 工具已返回的空档 / 思考流式）、
 推理遮罩（答案自带思考、思考切正文、`MouseRegion` 包装层、布局不识别时退回原生）、
 run 级 ticker 与时长、摘要格式化与按宽截断、按段的点击展开（含"非摘要行让路给 Pi 自己的
@@ -478,7 +486,7 @@ abort 后展开、transcript 重建、container 发现、offscreen 重绘（假 
 | --- | --- | --- |
 | 0.83.0 | 还在 `pi-extensions` 工作区里时跑的全套单测 + headless 回放 | 通过 |
 | 0.84.4 | 本目录独立安装后跑 `bun run check` + headless 回放 + 上面的逐帧回放 | 23/23 通过（当时还没有鼠标 API） |
-| 0.85.1 | 本目录的 devDependencies（鼠标 API 从 0.85 起才有）跑全套单测，含真 `TuiAltScreen` 的点击投递 | 39/39 通过 |
+| 0.85.1 | 本目录的 devDependencies（鼠标 API 从 0.85 起才有）跑全套单测，含真 `TuiAltScreen` 的点击投递 | 40/40 通过 |
 | 0.85.1 / 0.86.1 | 对照 `reference/pi` 与 npm 上 0.86.1 的 `assistant-message.js` / `markdown.ts` 逐行核对布局镜像（带 `MouseRegion`、同顺序的 Spacer） | 布局一致 |
 | 任何版本 | `pi -e ~/programming/run-fold/index.ts --print "reply ok"` | 宿主加载成功（非 TUI 模式按设计不生效） |
 
@@ -498,10 +506,10 @@ abort 后展开、transcript 重建、container 发现、offscreen 重绘（假 
   要等桥接组件下一次 render 才成功；中间那一帧按原生渲染（此时本来也没内容可折）。
   恢复会话时这意味着启动阶段那帧原生 transcript 需要靠 `/run-fold redraw`（或 fullscreen）才能
   显示折叠后的样子（见下一条）。
-- **失败收尾的 run 保留输出。** abort、或最后一行工具报错时，工具行与错误文本留给你看，不会折
-  成一个空摘要。回答生成前被 steer 打断则不同：那一段没有回答、也不算失败，会折成摘要（见 §2.2
-  决策四）。代价是"steer 之前那一步正好报错"这种形状会整段留在屏幕上——它在转录里和 abort 长得
-  一模一样，没有可靠的信号可以区分。
+- **失败收尾的 run 保留它失败的那一行。** abort、或最后一行工具报错时，那行错误文本留给你看，前面已经
+  走完的步骤折进摘要（见 §2.2 决策四）。run 停在转录末尾时（`agent_settled` 之后再没动静）整段保留：
+  它没有回答、也没有下文，屏幕上的东西就是它的全部结果。代价是失败行**上面**那些步骤的正文与输出也
+  会被折掉——如果那才是你要看的，`F2` 展开那一段就回来了。
 - **run 运行期间 transcript 会一涨一缩。** 实时尾部意味着每出现一步就多几行、下一步开始时再
   收回去；regular 模式下这些变矮会走 clear-on-shrink（见下一条）。fullscreen 模式里 transcript
   是 ScrollView，原地重排，没有这个问题——如果你在意实时尾部的观感，`--tui-mode fullscreen`。

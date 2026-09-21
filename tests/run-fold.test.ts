@@ -187,8 +187,8 @@ test("a settled answer folds its reasoning and an answerless run keeps its outpu
   assert.equal(entry?.summary?.thinkingRuns, 1);
   assert.equal(layout.get(trailingTool), undefined, "a plain trailing tool is a boundary, not part of the run");
 
-  // An aborted run leaves settled tool output behind: that output is the
-  // result the user needs, so it is never folded away.
+  // An aborted run leaves settled tool output behind, and it ends the transcript
+  // here: that output is the result the user needs, so it is never folded away.
   const aborted = new Container();
   const intermediate = assistantComponent(
     assistant({ timestamp: T0, tools: [{ id: "t", name: "read" }], stopReason: "toolUse" }),
@@ -1179,7 +1179,7 @@ test("a steer folds the steps it cut off instead of leaving them expanded", () =
   }
 });
 
-test("an aborted run expands again so its error output stays visible", async () => {
+test("an aborted run keeps its error row on screen, and nothing else once a boundary arrives", async () => {
   const chat = new Container();
   const aborted = assistant({ timestamp: T0, thinking: "先跑测试", tools: [{ id: "x", name: "bash" }], stopReason: "toolUse" });
   chat.addChild(assistantComponent(aborted));
@@ -1208,15 +1208,92 @@ test("an aborted run expands again so its error output stays visible", async () 
     assert.match(settled.join("\n"), /Aborted after 1 retry attempt/);
     assert.doesNotMatch(settled.join("\n"), /to expand/);
 
-    // The next prompt makes the aborted run a superseded one. A run that cut off
-    // because it failed still keeps its output: that is the result, not history.
+    // The next prompt makes the aborted run a superseded one: its step is history
+    // now, so it folds - and the row the run failed on is all that stays, because
+    // that error output is the result the reader is after.
     chat.addChild(new Spacer(1));
     chat.addChild(new UserMessageComponent("换个方向", markdownTheme));
     patch.refresh();
-    const afterNextPrompt = plain(chat.render(70)).filter(Boolean);
-    assert.match(afterNextPrompt.join("\n"), /先跑测试/);
-    assert.match(afterNextPrompt.join("\n"), /Aborted after 1 retry attempt/);
-    assert.doesNotMatch(afterNextPrompt.join("\n"), /to expand/);
+    const afterNextPrompt = plain(chat.render(70)).filter(Boolean).join("\n");
+    assert.match(afterNextPrompt, /▸ 1 thinking · \d+s\s+\(f2 to expand\)/, "the step folds under its own mark");
+    assert.doesNotMatch(afterNextPrompt, /先跑测试/, "and takes its reasoning with it");
+    assert.match(afterNextPrompt, /Aborted after 1 retry attempt/, "the failing row stays");
+    assert.match(afterNextPrompt, /换个方向/, "as does the prompt that cut the run off");
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("a failed run folds the steps that led to it and keeps only the row it failed on", () => {
+  const chat = new Container();
+  // The shape a real session left behind: three steps, the last one interrupted,
+  // and Pi's abort recovery marking the tool that was running as an error. The
+  // error row is the result; the two steps before it are history.
+  chat.addChild(
+    assistantComponent(
+      assistant({
+        timestamp: T0,
+        thinking: "先撤掉上次那个 pick",
+        text: "明白，开始整改。",
+        tools: [{ id: "a", name: "bash" }],
+        stopReason: "toolUse",
+      }),
+    ),
+  );
+  chat.addChild(toolComponent("a", "bash", "HEAD is now at 6cf7c1256d"));
+  chat.addChild(
+    assistantComponent(
+      assistant({
+        timestamp: T0 + 5_000,
+        thinking: "核对一致性",
+        tools: [{ id: "b", name: "bash" }],
+        stopReason: "toolUse",
+      }),
+    ),
+  );
+  chat.addChild(toolComponent("b", "bash", "M  epros-i18n/…"));
+  chat.addChild(
+    assistantComponent(
+      assistant({
+        timestamp: T0 + 11_000,
+        thinking: "再验一次",
+        tools: [{ id: "c", name: "bash" }],
+        stopReason: "aborted",
+      }),
+    ),
+  );
+  // Pi marks every tool still running when it aborts as an error, with the abort
+  // reason as its output (`interactive-mode.ts`, the `message_end` branch).
+  const abortedTool = new ToolExecutionComponent("bash", "c", {}, {}, undefined, ui, "/local/workspace");
+  abortedTool.updateResult({ content: [{ type: "text", text: "Operation aborted" }], isError: true });
+  chat.addChild(abortedTool);
+  chat.addChild(new Spacer(1));
+  chat.addChild(new UserMessageComponent("不是合并成一个提交，你就直接去掉再重新迁移就行。", markdownTheme));
+
+  const patch = installRunFoldPatch(options);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(
+    timingsSource(
+      new Map([
+        [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+        [T0 + 5_000, { startedAt: T0 + 5_000, completedAt: T0 + 6_000 }],
+        [T0 + 11_000, { startedAt: T0 + 11_000, completedAt: T0 + 12_000 }],
+      ]),
+    ),
+  );
+  try {
+    const lines = plain(chat.render(70));
+    const text = lines.filter(Boolean).join("\n");
+    assert.equal(lines.filter((line) => line.includes("▸")).length, 1, "the three steps fold into one mark");
+    assert.match(text, /▸ bash ×2 · 3 thinking · 12\.0s\s+\(f2 to expand\)/, "the mark counts what it took away");
+    assert.doesNotMatch(
+      text,
+      /先撤掉上次那个 pick|明白，开始整改|HEAD is now at|核对一致性|再验一次/,
+      "nothing of the steps that led to the failure stays",
+    );
+    assert.match(text, /Operation aborted/, "the row the run failed on stays");
+    assert.match(text, /不是合并成一个提交/, "and so does the prompt that cut the run off");
   } finally {
     patch.dispose();
   }

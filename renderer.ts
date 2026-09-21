@@ -443,11 +443,13 @@ function summarizeStretch(
  *   being produced - without the transcript growing with every step.
  * - Once the run settles only its answer survives: every step folds, and the
  *   reasoning inside the answer folds with them, because by then it is history
- *   rather than activity. A settled run without an answer keeps its content only
- *   when that content is the result - it failed, or it is still the end of the
- *   transcript. A boundary that cut it off first (`superseded`) makes it fold
- *   like any other finished run: a steer or a follow-up arrived, so whatever the
- *   run was doing is history, not an answer the reader is waiting on.
+ *   rather than activity. A settled run without an answer is one a boundary cut
+ *   off (`superseded`): a steer or a follow-up arrived, so its steps are history
+ *   and fold like any other finished run's - except for the one row a failure
+ *   ended on, which is the result the reader is after. A run that no boundary cut
+ *   off ends the transcript: what it left there is all the reader has, so it
+ *   stays whole - there is no answer to summarize it and no next run to fold it
+ *   into.
  */
 function foldRun(
   run: readonly ClassifiedChild[],
@@ -474,9 +476,13 @@ function foldRun(
   let visibleFrom: number;
   if (inFlight) visibleFrom = lastStep;
   else if (lastAnswer >= 0) visibleFrom = lastAnswer;
-  // Nothing of a superseded run belongs on screen: its steps are history for the
-  // same reason a folded run's are, and it has no answer of its own to keep.
-  else if (superseded && !endedInFailure(run)) visibleFrom = run.length;
+  // A superseded run has no answer of its own to keep, so its steps are history
+  // and fold like any other finished run's. The row it failed on is the one
+  // exception: that is the result the reader has to read. It stays alone - the
+  // steps that led to it are as much history as the next run's.
+  else if (superseded) visibleFrom = endedInFailure(run) ? lastStep : run.length;
+  // No answer and no boundary: this run ends the transcript, so what it left on
+  // screen is the end of the story rather than a step of it.
   else return;
   if (visibleFrom < 0) return;
 
