@@ -3,7 +3,13 @@ import {
   ToolExecutionComponent,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import {
+  Container,
+  truncateToWidth,
+  type Component,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
+} from "@earendil-works/pi-tui";
 
 /**
  * Run folding renders a whole agent run as:
@@ -131,6 +137,14 @@ export interface FoldMask {
   thinking?: boolean;
 }
 
+/**
+ * The stretch hosts the reader opened. A host is a live component, so the patch
+ * keeps them in a `WeakSet` and tests can hand in a plain `Set`.
+ */
+export interface ExpandedStretches {
+  has(component: Component): boolean;
+}
+
 export interface FoldEntry {
   hidden: boolean;
   /**
@@ -145,6 +159,12 @@ export interface FoldEntry {
    * summary (when this component hosts it) is rendered above the message.
    */
   mask?: FoldMask;
+  /**
+   * The reader opened this stretch by clicking its summary row: everything the
+   * stretch folded renders as Pi drew it, under a summary row that points down
+   * and closes the stretch again.
+   */
+  expanded?: boolean;
   /**
    * Keep a reasoning run that nothing visible follows: it is what the run is
    * producing right now (or, when settled, the only thing the message says).
@@ -436,6 +456,7 @@ function foldRun(
   timings: TimingSource,
   active: boolean,
   superseded: boolean,
+  expanded?: ExpandedStretches,
 ): void {
   let lastAnswer = -1;
   let lastStep = -1;
@@ -559,14 +580,22 @@ function foldRun(
     // One component renders the summary: the first row the stretch takes away
     // whole, or - when it takes content only - the first row it masks.
     const host = rows.find((row) => row.hidden)?.entry ?? rows[0]!.entry;
-    for (const row of rows) {
-      const hosting = row.entry === host ? { summary } : {};
-      layout.set(
-        row.entry.component,
-        row.hidden
-          ? { hidden: true, ...hosting }
-          : { hidden: false, mask: row.mask, keepTrailingReasoning: row.keepTrailing, ...hosting },
-      );
+    if (expanded?.has(host.component)) {
+      // The reader opened this stretch, so nothing in it folds: the host keeps
+      // its summary row as the header that closes the stretch again, and every
+      // row - the host included - renders exactly as Pi drew it. The host is
+      // what the click is keyed on, so the header lands where the mark was.
+      layout.set(host.component, { hidden: false, summary, expanded: true });
+    } else {
+      for (const row of rows) {
+        const hosting = row.entry === host ? { summary } : {};
+        layout.set(
+          row.entry.component,
+          row.hidden
+            ? { hidden: true, ...hosting }
+            : { hidden: false, mask: row.mask, keepTrailingReasoning: row.keepTrailing, ...hosting },
+        );
+      }
     }
     startedAt = endedAt;
   }
@@ -581,12 +610,18 @@ function foldRun(
  * a finished assistant message (with tool calls) and the next one, nothing in
  * the transcript is pending, but the run is clearly not over: the flag keeps it
  * folded and its clock live instead of falling back to native rendering.
+ *
+ * `expanded` holds the stretch hosts the reader opened by clicking their summary
+ * row. An expanded stretch still gets its summary - nothing about what it folded
+ * changes, only whether that content stays folded - so the same row closes it
+ * again.
  */
 export function computeFoldLayout(
   children: readonly Component[],
   options: RunFoldOptions,
   timings: TimingSource = NO_TIMINGS,
   active = false,
+  expanded?: ExpandedStretches,
 ): Map<Component, FoldEntry> {
   const layout = new Map<Component, FoldEntry>();
   if (!options.folded) return layout;
@@ -597,7 +632,7 @@ export function computeFoldLayout(
   // delivered mid-turn (a steer, a follow-up), a banner, a compaction summary -
   // came next, so the run never reached the end of the transcript on its own.
   const flush = (runActive: boolean, superseded: boolean) => {
-    if (run.length > 0) foldRun(run, layout, options, timings, runActive, superseded);
+    if (run.length > 0) foldRun(run, layout, options, timings, runActive, superseded, expanded);
     run = [];
   };
   for (const child of children) {
@@ -639,9 +674,35 @@ function summaryBody(summary: RunSummary): string {
   return parts.length > 0 ? parts.join(" · ") : "collapsed";
 }
 
+/**
+ * How a summary row points at the content under it, and how it says to move:
+ * the key that toggles folding always works, the mouse only where the TUI routes
+ * pointer input (see `RunFoldPatchHandle.setClickToToggle`).
+ */
+interface SummaryPresentation {
+  arrow: string;
+  hint: string;
+}
+
+function summaryPresentation(
+  toggleKey: string,
+  expanded: boolean,
+  clickToToggle: boolean,
+): SummaryPresentation {
+  if (expanded) return { arrow: "▾ ", hint: "click to collapse" };
+  return {
+    arrow: "▸ ",
+    hint: clickToToggle ? `click or ${toggleKey} to expand` : `${toggleKey} to expand`,
+  };
+}
+
+function summaryRow(summary: RunSummary, presentation: SummaryPresentation): string {
+  return `${presentation.arrow}${summaryBody(summary)}  (${presentation.hint})`;
+}
+
 /** Plain-text summary, used by tests. */
 export function formatRunSummary(summary: RunSummary, toggleKey = DEFAULT_RUN_FOLD_TOGGLE_KEY): string {
-  return `▸ ${summaryBody(summary)}  (${toggleKey} to expand)`;
+  return summaryRow(summary, summaryPresentation(toggleKey, false, false));
 }
 
 /**
@@ -650,6 +711,9 @@ export function formatRunSummary(summary: RunSummary, toggleKey = DEFAULT_RUN_FO
  * `Spacer(1)` of the assistant message we hide: a run follows the user prompt,
  * whose background box has a full row of background below the text, so the
  * summary would otherwise sit flush against that background block.
+ *
+ * `expanded` is the stretch the reader opened: the arrow points down and the row
+ * is where the click that closes it lands.
  */
 export function renderRunSummaryLines(
   summary: RunSummary,
@@ -657,15 +721,18 @@ export function renderRunSummaryLines(
   theme: Theme | undefined,
   toggleKey = DEFAULT_RUN_FOLD_TOGGLE_KEY,
   pad = 1,
+  expanded = false,
+  clickToToggle = false,
 ): string[] {
   const available = Math.max(4, width - pad * 2);
   const paint = (color: Parameters<Theme["fg"]>[0], text: string) =>
     theme ? theme.fg(color, text) : text;
+  const presentation = summaryPresentation(toggleKey, expanded, clickToToggle);
   const line = [
-    paint("muted", "▸ "),
+    paint("muted", presentation.arrow),
     paint("dim", summaryBody(summary)),
     "  ",
-    paint("muted", `(${toggleKey} to expand)`),
+    paint("muted", `(${presentation.hint})`),
   ].join("");
   return ["", " ".repeat(pad) + truncateToWidth(line, available, "…")];
 }
@@ -673,6 +740,13 @@ export function renderRunSummaryLines(
 const PATCH_SYMBOL = Symbol.for("@99percentpeople/pi-run-fold/render-patch");
 
 type RenderFn = (this: Component, width: number) => string[];
+type MouseHandler = (this: Component, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
+
+/** What a host component's `handleMouse` was before we put the click on it. */
+interface MouseSwap {
+  own: boolean;
+  handleMouse?: MouseHandler;
+}
 
 interface LayoutCache {
   signature: string;
@@ -686,6 +760,12 @@ export interface RunFoldPatchHandle {
   /** Whether the agent is still working on the trailing run. */
   setRunActive(active: boolean): void;
   setToggleKey(key: string): void;
+  /**
+   * Whether a summary row can be clicked. Pi routes mouse input to components in
+   * fullscreen mode only: in regular mode the terminal owns its scrollback, so
+   * the summary keeps telling the reader about the key instead.
+   */
+  setClickToToggle(enabled: boolean): void;
   setTimingSource(timings: TimingSource): void;
   /** The chat container used for run grouping; undefined disables folding. */
   setContainer(container: Container | undefined): void;
@@ -701,11 +781,23 @@ interface PatchRecord {
   options: RunFoldOptions;
   toggleKey: string;
   runActive: boolean;
+  clickToToggle: boolean;
   timings: TimingSource;
   container?: Container;
   theme?: Theme;
   revision: number;
   cache?: LayoutCache;
+  /** The stretches the reader opened, keyed by the component hosting the summary. */
+  expandedStretches: WeakSet<Component>;
+  /**
+   * Lines the summary block takes at the top of each host's output. It sits
+   * above the rows the host's own mouse layout knows about, so a click on it is
+   * ours and every other row has to be handed on with those lines taken off.
+   */
+  summaryBlocks: WeakMap<Component, number>;
+  /** Hosts whose `handleMouse` we replaced, and what to put back. */
+  mouseHosts: Map<Component, MouseSwap>;
+  mouseHandler: MouseHandler;
   baseAssistantRender: RenderFn;
   baseToolRender: RenderFn;
   patchedAssistantRender: RenderFn;
@@ -737,14 +829,58 @@ function componentId(component: Component): number {
  */
 function ensureLayout(record: PatchRecord): Map<Component, FoldEntry> {
   const container = record.container;
-  if (!container) return new Map();
+  if (!container) {
+    syncMouseHosts(record);
+    return new Map();
+  }
   const children = container.children;
   const last = children[children.length - 1];
   const key = `${record.revision}|${children.length}|${last ? componentId(last) : "none"}`;
   if (record.cache?.signature === key) return record.cache.layout;
-  const layout = computeFoldLayout(children, record.options, record.timings, record.runActive);
+  const layout = computeFoldLayout(
+    children,
+    record.options,
+    record.timings,
+    record.runActive,
+    record.expandedStretches,
+  );
+  syncMouseHosts(record, layout);
   record.cache = { signature: key, layout };
   return layout;
+}
+
+/**
+ * Put the click on the row that opens a stretch, and take it off again when that
+ * component stops hosting a summary, when folding is turned off, or on dispose.
+ *
+ * The host is one of Pi's own components, so the handler goes on the instance:
+ * mouse dispatch skips a container whose `handleMouse` is still the inherited
+ * one, and a handler of its own is exactly what makes the summary row reachable.
+ * Replacing it has to keep `ToolExecutionComponent.handleMouse` working for every
+ * other row, since that one forwards clicks inside the tool's own output.
+ */
+function syncMouseHosts(record: PatchRecord, layout?: Map<Component, FoldEntry>): void {
+  const hosts = new Set<Component>();
+  if (layout && record.clickToToggle) {
+    for (const [component, entry] of layout) {
+      if (entry.summary) hosts.add(component);
+    }
+  }
+  for (const [component, swap] of record.mouseHosts) {
+    if (hosts.has(component)) continue;
+    record.mouseHosts.delete(component);
+    if (component.handleMouse !== record.mouseHandler) continue;
+    if (swap.own) component.handleMouse = swap.handleMouse;
+    else delete (component as { handleMouse?: MouseHandler }).handleMouse;
+  }
+  for (const component of hosts) {
+    if (record.mouseHosts.has(component)) continue;
+    record.mouseHosts.set(component, {
+      own: Object.prototype.hasOwnProperty.call(component, "handleMouse"),
+      handleMouse: component.handleMouse,
+    });
+    component.handleMouse = record.mouseHandler;
+  }
 }
 
 function renderFolded(
@@ -761,23 +897,26 @@ function renderFolded(
     return native.call(component, width);
   }
   if (!entry) return native.call(component, width);
-  if (entry.hidden) {
-    if (!entry.summary) return [];
-    return renderRunSummaryLines(
-      entry.summary,
-      width,
-      record.theme,
-      record.toggleKey,
-      outputPadOf(component),
-    );
-  }
-  if (!entry.mask) return native.call(component, width);
-  const lines = renderMasked(component, width, native, entry.mask, entry.keepTrailingReasoning === true);
-  if (!entry.summary) return lines;
-  return [
-    ...renderRunSummaryLines(entry.summary, width, record.theme, record.toggleKey, outputPadOf(component)),
-    ...lines,
-  ];
+  const summary = entry.summary
+    ? renderRunSummaryLines(
+        entry.summary,
+        width,
+        record.theme,
+        record.toggleKey,
+        outputPadOf(component),
+        entry.expanded === true,
+        record.clickToToggle,
+      )
+    : undefined;
+  if (summary) record.summaryBlocks.set(component, summary.length);
+  else record.summaryBlocks.delete(component);
+  if (entry.hidden) return summary ?? [];
+  // An expanded stretch has no mask: everything the fold took away renders as Pi
+  // drew it, under the row that closes the stretch again.
+  const lines = entry.mask
+    ? renderMasked(component, width, native, entry.mask, entry.keepTrailingReasoning === true)
+    : native.call(component, width);
+  return summary ? [...summary, ...lines] : lines;
 }
 
 /**
@@ -917,11 +1056,40 @@ function createPatchRecord(options: Partial<RunFoldOptions>): PatchRecord {
     options: { ...DEFAULT_RUN_FOLD_OPTIONS, ...options },
     toggleKey: DEFAULT_RUN_FOLD_TOGGLE_KEY,
     runActive: false,
+    clickToToggle: false,
     timings: NO_TIMINGS,
     revision: 0,
+    expandedStretches: new WeakSet<Component>(),
+    summaryBlocks: new WeakMap<Component, number>(),
+    mouseHosts: new Map<Component, MouseSwap>(),
     baseAssistantRender: assistantPrototype.render,
     baseToolRender: toolPrototype.render,
   } as PatchRecord;
+
+  record.mouseHandler = function runFoldSummaryClick(
+    this: Component,
+    event: TuiMouseEvent,
+  ): TuiMouseEventResult | undefined {
+    const block = record.summaryBlocks.get(this);
+    const previous = record.mouseHosts.get(this)?.handleMouse;
+    if (block === undefined || !previous) return undefined;
+    if (event.type === "click" && event.button === "left" && event.y === block - 1) {
+      if (record.expandedStretches.has(this)) record.expandedStretches.delete(this);
+      else record.expandedStretches.add(this);
+      // The click renders anyway (mouse results render by default); the bumped
+      // revision is what makes that render use the new fold state.
+      record.revision += 1;
+      record.cache = undefined;
+      return { handled: true };
+    }
+    // Every other row stays Pi's business: a tool row forwards clicks into the
+    // output it drew, and an assistant message hands them to the reasoning
+    // blocks it wrapped in mouse regions of its own. The summary is drawn above
+    // everything those handlers measure from, so its lines come off first.
+    return Reflect.apply(previous, this, [
+      { ...event, y: event.y - block, height: Math.max(0, event.height - block) },
+    ]);
+  };
 
   // Each wrap closes over its base so other extensions' patches keep working
   // underneath ours, and so re-asserting after a reload cannot stack wrappers.
@@ -1008,6 +1176,12 @@ export function installRunFoldPatch(
       record.toggleKey = key.trim() || DEFAULT_RUN_FOLD_TOGGLE_KEY;
       record.cache = undefined;
     },
+    setClickToToggle(enabled) {
+      if (record.clickToToggle === enabled) return;
+      record.clickToToggle = enabled;
+      record.revision += 1;
+      record.cache = undefined;
+    },
     setRunActive(active) {
       if (record.runActive === active) return;
       record.runActive = active;
@@ -1040,6 +1214,7 @@ export function installRunFoldPatch(
       disposed = true;
       record.owners -= 1;
       if (record.owners > 0 || getPatchRecord() !== record) return;
+      syncMouseHosts(record);
       const assistant = AssistantMessageComponent.prototype as unknown as { render: RenderFn };
       const tool = ToolExecutionComponent.prototype as unknown as { render: RenderFn };
       if (assistant.render === record.patchedAssistantRender) assistant.render = record.baseAssistantRender;

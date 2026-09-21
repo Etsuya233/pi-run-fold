@@ -35,7 +35,8 @@ const FULL_REDRAW_CLEAR = "\x1b[2J\x1b[H\x1b[3J";
 /**
  * Folds every agent run down to its prompt, a one-line summary
  * (`▸ read ×2, bash · 2 thinking · 12.4s`), and the final answer. While the run
- * works, its newest step stays on screen as the live tail.
+ * works, its newest step stays on screen as the live tail. Clicking a summary
+ * row in fullscreen mode opens the stretch under it (`▾`, click again to fold).
  *
  * Display only: messages, session entries, and model context are untouched.
  */
@@ -62,6 +63,8 @@ export default function (pi: ExtensionAPI) {
   let repaintOffscreen = false;
   /** `/run-fold statusline off`: leave the shared footer line to the other extensions. */
   let statusLineVisible = true;
+  /** Fullscreen routes mouse input to components; regular mode leaves it to the terminal. */
+  let mouseAvailable = false;
   let offscreenHintShown = false;
 
   const useTimings = () => {
@@ -74,6 +77,19 @@ export default function (pi: ExtensionAPI) {
   const refresh = () => {
     patch?.refresh();
     requestRender?.();
+  };
+
+  /**
+   * Tell the renderer whether a summary row can be clicked, so the row points at
+   * the mouse where there is one and at the key where there is not. Fullscreen
+   * owns the viewport and dispatches pointer events; regular mode hands the
+   * scrollback to the terminal, which never reports clicks on it.
+   */
+  const syncMouseMode = (instance: TUI) => {
+    const clickable = instance.mode === "fullscreen";
+    if (clickable === mouseAvailable) return;
+    mouseAvailable = clickable;
+    patch?.setClickToToggle(clickable);
   };
 
   /**
@@ -226,6 +242,7 @@ export default function (pi: ExtensionAPI) {
         theme = current;
         patch?.setTheme(current);
       }
+      syncMouseMode(bridgeTui);
       if (ctx?.mode === "tui") {
         const found = findChatContainer(bridgeTui);
         if (found && found !== container) {
@@ -255,6 +272,7 @@ export default function (pi: ExtensionAPI) {
     timings.clear();
     runActive = false;
     repaintOffscreen = false;
+    mouseAvailable = false;
     offscreenHintShown = false;
     restoreTimings(context);
     useTimings();
@@ -266,6 +284,8 @@ export default function (pi: ExtensionAPI) {
       (bridgeTui) => {
         tui = bridgeTui;
         requestRender = () => bridgeTui.requestRender();
+        // Before the first frame, so the summary rows already offer the mouse.
+        syncMouseMode(bridgeTui);
         return renderBridge(bridgeTui);
       },
       { placement: "belowEditor" },
@@ -482,6 +502,7 @@ export {
   formatToolNames,
   installRunFoldPatch,
   renderRunSummaryLines,
+  type ExpandedStretches,
   type FoldClassification,
   type FoldEntry,
   type FoldMask,

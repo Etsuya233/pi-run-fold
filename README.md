@@ -6,7 +6,8 @@
 > works, the newest step (the running tool, the streaming text, or the reasoning
 > being produced) stays on screen as the live tail. Intermediate text, thinking,
 > and tool calls fold independently (`/run-fold text|thinking|tool on|off`), and
-> `F2` turns folding off entirely.
+> `F2` turns folding off entirely. In fullscreen mode a click on a summary row
+> opens that one stretch (`▸` turns into `▾`; click it again to fold it back).
 > Display-only: no session entries, no message mutation, no model-context change.
 > *This document is written in Chinese because it is a design note; the extension
 > itself and its API are English.*
@@ -44,6 +45,22 @@ run 结束后的样子：
 折叠前同一份 transcript 是 40 行工具输出 + 3 段中间叙述，全折掉后只剩 6 行。
 `F2` 关掉折叠、回到原生渲染，再按一次折回。
 
+**点摘要行展开**（只在 fullscreen 下）：点那行，它折掉的东西就原样回到屏幕上，箭头翻成 `▾`：
+
+```text
+  让我先看看 package.json。
+
+  ▾ read · 2 thinking · 6.3s  (click to collapse)
+  $ cat package.json
+  { "name": "..." }
+
+  这是 bun 工作区，测试入口是 bun run test。
+```
+
+再点同一行折回去。粒度和摘要一致——**一段**：屏幕上留着的行会把折叠切成几段，点哪段开哪段。
+鼠标事件由 Pi 只发给占有 viewport 的那个 TUI，regular 模式里 transcript 归终端管（滚动、选中
+都靠终端自己做），Pi 收不到那上面的点击，于是摘要行维持原来的 `(f2 to expand)` 文案。
+
 ---
 
 ## 1. 快速开始
@@ -61,6 +78,7 @@ pi remove  ~/programming/run-fold
 
 | 入口 | 作用 |
 | --- | --- |
+| 点摘要行（fullscreen） | 展开 / 收起**那一段**折叠 |
 | `F2` | 折叠总开关（关 = 原生渲染） |
 | `/run-fold` | 同上（toggle） |
 | `/run-fold fold on\|off` | 同上，显式开关 |
@@ -207,10 +225,10 @@ compaction 卡片、状态文本、Spacer、横幅）都是边界；`CustomMessa
   变样（这正是本条被拆两次才定下来的原因）。
 
 宿主仍是段内某个被折掉的现有组件，不新插入：它**本来就在摘要该在的位置上**，高度变化由 Pi 的
-`mouseLayout` 自动记账，点击区域也天然落在它身上（后续要做"点摘要展开"只需给这个实例挂
-`handleMouse`）。优先选段内第一个被**整条**折掉的行（默认策略下就是第一条工具行）；若这一段
-没有任何东西被整条折掉（比如只有段内多个步骤的思考被遮罩），就选第一个被遮罩的步骤，摘要
-印在它上面。关掉折叠时布局表为空，摘要随之消失——因为渲染它的组件自己也不再被隐藏。
+`mouseLayout` 自动记账，点击区域也天然落在它身上（见 §2.6）。优先选段内第一个被**整条**折掉的行
+（默认策略下就是第一条工具行）；若这一段没有任何东西被整条折掉（比如只有段内多个步骤的思考被遮罩），
+就选第一个被遮罩的步骤，摘要印在它上面。关掉折叠时布局表为空，摘要随之消失——因为渲染它的组件
+自己也不再被隐藏。
 
 #### 决策四：实时尾部 + 「最终回答」
 
@@ -305,6 +323,31 @@ run 还没结束时成立），它最后的 thinking 一样折进摘要。判据
 （`MasuRii/pi-tool-display` 就是靠"发现别人占有就退让"来共存的）。这条路线留作后续选项
 （见 §7）。
 
+### 2.6 点击摘要行展开（fullscreen）
+
+一段展开就是四个处的配合，都不改动 Pi 的结构：
+
+1. **状态**：`expandedStretches` 是个 `WeakSet<Component>`，键是**那一段的宿主**（谁印摘要就是
+   谁）。放进 `computeFoldLayout()` 的一个参数里，纯函数仍然是纯的。展开的段在 `foldRun` 里
+   走另一条分支：段内没有任何行被藏或被遮罩，只在宿主上留一个 `{ hidden: false, summary,
+   expanded: true }`——摘要行的位置、内容、计数全都不变，变的只是它下面的东西又画出来了。
+2. **命中**：`handleMouse` 挂在宿主**实例**上（`renderer.ts` 的 `syncMouseHosts()`），每一帧的
+   布局重算时增删一次。之所以要挂自己的：Pi 的 `dispatchMouseToLayout` 会把 `handleMouse` 仍是
+   `Container.prototype.handleMouse` 的盒子跳过，一个自己的实现正是"这行可点"的标志。
+3. **坐标**：事件到手时 `event.y` 已经是**组件自己的行号**（每个容器都把自己上面的行数减掉了），
+   而摘要块固定占两行（一个空行 + 摘要行），所以判定就是 `event.y === 1`。这个 1 不是写死的：
+   渲染时把真正的块高记进 `summaryBlocks`。非摘要行必须原样让路，而且**得把块高从 y 里减掉**再
+   递下去——工具行靠自己的 `handleMouse` 把点击转给工具内部，assistant 消息靠它把点击转给 Pi 包
+   在思考块外面的 `MouseRegion`（`assistant-message.js:120`，点击会收起那段思考）；两者量行数都
+   从自己内容的第一行开始，不知道上面多了两行。
+4. **时机与选中**：只接管 `type === "click"`（且左键），`press` 一律放走。所以按住拖动还是选中
+   文本（Pi 在 release 时发现拖过了就不再把它当 click），而点一下会在 release 的那次重派发里换成
+   折叠状态；鼠标结果默认触发重绘，布局缓存靠 revision 失效（`ensureLayout()`）。
+
+状态只活在内存里、按组件实例计，`/compact`、`/tree`、resume 重建 transcript 之后就没了——和
+`F2` 一样不落盘（见 §5）。regular 模式下 Pi 根本不接管鼠标，`setClickToToggle(false)` 会让宿主
+干净地不挂任何东西，摘要行继续写 `(f2 to expand)`。
+
 ---
 
 ## 3. 参考项目与源码位置
@@ -336,6 +379,7 @@ run 还没结束时成立），它最后的 thinking 一样折进摘要。判据
 | `components/tool-execution.ts:254,259,401` | `render` 的 `hideComponent` 分支、`self` 外壳、空渲染判定 | 隐藏的可行性依据；没走官方路线的对照 |
 | `core/agent-session.ts:682` | `// Emit to extensions first` | **扩展事件早于组件创建**，所以不能在 `message_start` 里抓组件 |
 | `tui/src/tui.ts:319,344,366` | `Container` 的 `handleMouse` / `render` | 返回 `[]` 等于零高度零空行，鼠标自动落到邻居 |
+| `tui/src/layout.ts` 的 `dispatchMouseToLayout` / `layout-node.ts` | 鼠标命中的实现：按 box 递归命中，最后才走容器链（`Container.handleMouse` 把自己行数减掉），并跳过 `handleMouse` 还是继承版实现的容器 | 为什么点摘要行要往宿主**实例**上挂 handler，以及为什么递下去之前要把摘要块的行数减掉（§2.6） |
 | `tui/src/tui-main-screen.ts:277,357,451` | `fullRender(true)` 触发条件（clear-on-shrink、改动行在视口上方） | regular 模式下"变矮"会清屏+清 scrollback 重写（§5） |
 | `core/extensions/runner.ts:77` | `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` | 为什么默认键不是 `ctrl+o/t` |
 | `core/extensions/loader.ts:121,517` | jiti `alias` / 二进制 `virtualModules` | 扩展的 `@earendil-works/*` 由 Pi 注入 → 独立目录不需要运行时依赖，且 `instanceof` 必然成立 |
@@ -416,12 +460,15 @@ folded + refresh() every frame   2.09 ms/frame     ← 最坏情况；实际每�
 
 ### 4.3 测试
 
-34 个测试覆盖：run 分组与边界、被 steer 截断的 run（vs 失败收尾的 run）、实时尾部（工具在手 /
+39 个测试覆盖：run 分组与边界、被 steer 截断的 run（vs 失败收尾的 run）、实时尾部（工具在手 /
 工具已返回的空档 / 思考流式）、
 推理遮罩（答案自带思考、思考切正文、`MouseRegion` 包装层、布局不识别时退回原生）、
-run 级 ticker 与时长、摘要格式化与按宽截断、prototype 包装与还原、外来补丁后的自愈、
+run 级 ticker 与时长、摘要格式化与按宽截断、按段的点击展开（含"非摘要行让路给 Pi 自己的
+`MouseRegion`"、fullscreen/regular 两种模式下扩展的接线、dispose 后归还宿主的 `handleMouse`）、
+prototype 包装与还原、外来补丁后的自愈、
 abort 后展开、transcript 重建、container 发现、offscreen 重绘（假 terminal + 真 `TuiMainScreen` +
-模拟 preserve-scrollback 状态）、扩展完整生命周期。
+模拟 preserve-scrollback 状态）、真 `TuiAltScreen` 下投递一条 SGR 鼠标序列（验布局分发给的局部 y
+就是摘要行的 y）、扩展完整生命周期。
 测试用**真实的 Pi 组件**（`AssistantMessageComponent` / `ToolExecutionComponent` /
 `UserMessageComponent`）和假的 TUI/ctx 断言渲染出来的行。
 
@@ -430,19 +477,16 @@ abort 后展开、transcript 重建、container 发现、offscreen 重绘（假 
 | Pi 版本 | 怎么验的 | 结果 |
 | --- | --- | --- |
 | 0.83.0 | 还在 `pi-extensions` 工作区里时跑的全套单测 + headless 回放 | 通过 |
-| 0.84.4 | 本目录独立安装后跑 `bun run check` + headless 回放 + 上面的逐帧回放 | 23/23 通过 |
-| 0.85.1 / 0.86.1 | 对照 `reference/pi` 与 npm 上 0.86.1 的 `assistant-message.js` / `markdown.ts` 逐行核对布局镜像（带 `MouseRegion`、同顺序的 Spacer） | 布局一致；未在该版本跑测试 |
+| 0.84.4 | 本目录独立安装后跑 `bun run check` + headless 回放 + 上面的逐帧回放 | 23/23 通过（当时还没有鼠标 API） |
+| 0.85.1 | 本目录的 devDependencies（鼠标 API 从 0.85 起才有）跑全套单测，含真 `TuiAltScreen` 的点击投递 | 39/39 通过 |
+| 0.85.1 / 0.86.1 | 对照 `reference/pi` 与 npm 上 0.86.1 的 `assistant-message.js` / `markdown.ts` 逐行核对布局镜像（带 `MouseRegion`、同顺序的 Spacer） | 布局一致 |
 | 任何版本 | `pi -e ~/programming/run-fold/index.ts --print "reply ok"` | 宿主加载成功（非 TUI 模式按设计不生效） |
 
-跨版本踩到的一个真实差异：**`TUI` 从 0.84 起不再由 `@earendil-works/pi-coding-agent`
-再导出**，要从 `@earendil-works/pi-tui` 引（`index.ts` 一直是从 pi-tui 引的，只有测试文件需要改）。
-临时切到 0.85.1 复验：
-
-```bash
-bun add -d @earendil-works/pi-ai@0.85.1 @earendil-works/pi-coding-agent@0.85.1 @earendil-works/pi-tui@0.85.1
-bun run check
-bun install   # 回到 ^0.84.3
-```
+跨版本踩到的两个真实差异：**`TUI` 从 0.84 起不再由 `@earendil-works/pi-coding-agent`
+再导出**，要从 `@earendil-works/pi-tui` 引（`index.ts` 一直是从 pi-tui 引的，只有测试文件需要改）；
+以及 0.85 的 bash 工具行把参数画成 JSON 块而不是 `$ 命令`（一个断言从 `/\$/` 改成"这一段就是它
+原生渲染的那几行"，更接近不变量本身）。devDependencies 现在停在 `^0.85.1`：`handleMouse` /
+`TuiMouseEvent` / `TuiAltScreen` 都是 0.85 才有的 API，在 0.84 的 d.ts 里连类型都没有。
 
 ---
 
@@ -478,7 +522,11 @@ bun install   # 回到 ^0.84.3
   `instanceof` 与 Pi 新建的组件是同一个类。若把代码搬到别的宿主里自己 import，会拿到第二份类，
   `instanceof` 就会失效——这也是为什么这里始终用 `instanceof` 而不是 `constructor.name`
   （后者只用于 Pi 没导出的 `CustomMessageComponent`/`CustomEntryComponent`）。
-- 配置只在内存里（没接 settings 文件）；展开状态不持久化；没有 per-run 展开 / 点击摘要行。
+- **按段的展开状态只在内存里、只认那一个组件实例。** 点开的段记在 `WeakSet<Component>` 上，所以
+  `/compact`、`/tree`、resume 重建 transcript（甚至 Pi 重建某个消息组件）之后都回到折叠。
+  和 `F2` / 三类开关一样不落盘。另一个后果：只有 fullscreen 能展开某一段，regular 模式下想展开
+  哪一段只能靠 `F2` 全部展开（见 §2.6）。
+- 配置只在内存里（没接 settings 文件）。
 
 ---
 
@@ -513,7 +561,10 @@ pi -e ~/programming/run-fold/index.ts --print "reply with the single word ok"
 
 ## 7. 后续可以做的方向
 
-1. **per-run 展开 + 点击摘要行**：给渲染摘要的那个组件实例挂 `handleMouse`（位置与高度 Pi 已算好）。
+1. **键盘打开单段**：鼠标能开一段了，但 regular 模式（默认）只能 `F2` 全部展开。差一个"当前段"
+   的概念加一个键（比如 `f3` 开/关最后一段折叠），顺带能把展开状态写进 settings 落盘。
+2. **展开状态落盘**：现在按组件实例记，重建就丢（§5）。换成按 run 的稳定标识（第一个 assistant
+   的 `timestamp` 已经在 `timings` 里当了 key）+ 段序号，就能跨 resume 记住哪段是开的。
 2. **摘要内容扩展**：tokens/花费（`message.usage`）、错误标记、文件改动计数、工具失败高亮。
 3. **可选工具层**：按 §2.5 走官方 `registerTool` 覆盖 + `renderShell: "self"`，把"工具块隐藏"
    变成配置项；必须同时抄 pi-tool-display 的 ownership 发现与 `/reload` 清理。
@@ -523,4 +574,5 @@ pi -e ~/programming/run-fold/index.ts --print "reply with the single word ok"
    （`markdown.ts:285` 会直接 `return []`）。代码更短，但要额外处理 `Markdown` 的渲染缓存
    （transform 结果不在 cache key 里）和 Pi 自加的空 Spacer 行；当前选择子组件遮罩就是为了绕开这两点。
 6. **上游化**：Pi 若提供 transcript 渲染钩子，这套 patch 可以整体退化成钩子里的一次过滤
-   （`computeFoldLayout()` 已经是纯函数，与 patch 层解耦）。
+   （`computeFoldLayout()` 已经是纯函数，与 patch 层解耦）；同理，若 transcript 的层叠容器真的给出
+   每个子组件的 box，"点摘要展开"可以不再自己算行号，直接给宿主包一层 `MouseRegion`。

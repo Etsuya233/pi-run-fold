@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 // Since Pi 0.84 `TUI` is no longer re-exported from pi-coding-agent; it is
 // defined in pi-tui (pi-coding-agent 0.83 exported both).
-import { Container, Spacer, Text, TuiMainScreen, type Terminal, type TUI } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, TuiAltScreen, TuiMainScreen, type Component, type Terminal, type TUI } from "@earendil-works/pi-tui";
 import runFoldExtension, {
   DEFAULT_RUN_FOLD_OPTIONS,
   assertRunFoldPatch,
@@ -92,6 +92,26 @@ const options: RunFoldOptions = { ...DEFAULT_RUN_FOLD_OPTIONS, hideIntermediateT
 
 function plain(lines: string[]): string[] {
   return lines.map((line) => stripVTControlCharacters(line).trimEnd());
+}
+
+/**
+ * A left click on one row of a component, the way Pi's layout dispatch delivers
+ * it: coordinates are local to the component the pointer landed on.
+ */
+function clickRow(component: Component, y: number) {
+  return component.handleMouse?.({
+    type: "click",
+    button: "left",
+    x: 2,
+    y,
+    screenX: 2,
+    screenY: 10,
+    width: 70,
+    height: component.render(70).length,
+    shift: false,
+    alt: false,
+    ctrl: false,
+  });
 }
 
 test("a run keeps only its last assistant message and folds everything else", () => {
@@ -811,6 +831,176 @@ test("the render patch folds live components and restores them on dispose", () =
   assert.match(restored.join("\n"), /narration|hello|world/);
 });
 
+test("clicking a summary row opens its stretch and clicking it again folds it back", () => {
+  const chat = new Container();
+  const step = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "先看测试",
+      text: "first narration",
+      tools: [{ id: "a", name: "read" }],
+      stopReason: "toolUse",
+    }),
+  );
+  const answer = assistantComponent(assistant({ timestamp: T0 + 1_000, text: "first answer" }));
+  // The answer's own reasoning is a stretch of its own: it folds into a summary
+  // row that the answer itself hosts, above content that stays on screen.
+  const second = assistantComponent(
+    assistant({ timestamp: T0 + 5_000, thinking: "再看一遍", text: "second answer" }),
+  );
+  chat.addChild(step);
+  chat.addChild(toolComponent("a", "read", "file body"));
+  chat.addChild(answer);
+  chat.addChild(new UserMessageComponent("换个方向", markdownTheme, 1, []));
+  chat.addChild(second);
+
+  const patch = installRunFoldPatch(options);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setClickToToggle(true);
+  patch.setTimingSource(
+    timingsSource(
+      new Map([
+        [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+        [T0 + 1_000, { startedAt: T0 + 1_500, completedAt: T0 + 2_000 }],
+        [T0 + 5_000, { startedAt: T0 + 5_000, completedAt: T0 + 6_000 }],
+      ]),
+    ),
+  );
+  try {
+    const folded = plain(chat.render(70)).filter(Boolean).join("\n");
+    assert.match(folded, /▸ read · 1 thinking · 2\.0s\s{2}\(click or f2 to expand\)/);
+    assert.match(folded, /▸ 1 thinking · 1\.0s\s{2}\(click or f2 to expand\)/);
+    assert.doesNotMatch(folded, /first narration|file body|先看测试|再看一遍/);
+
+    assert.notEqual(step.handleMouse, Container.prototype.handleMouse, "the summary row is reachable");
+    assert.equal(clickRow(step, 0), undefined, "the blank row above the summary is not a target");
+    assert.deepEqual(clickRow(step, 1), { handled: true });
+
+    const opened = plain(chat.render(70)).join("\n");
+    assert.match(opened, /▾ read · 1 thinking · 2\.0s\s{2}\(click to collapse\)/);
+    assert.match(opened, /first narration/);
+    assert.match(opened, /file body/);
+    assert.match(opened, /先看测试/, "the stretch opens everything it folded, reasoning included");
+    assert.match(opened, /▸ 1 thinking · 1\.0s\s{2}\(click or f2 to expand\)/, "expanding is per stretch");
+    assert.doesNotMatch(opened, /再看一遍/);
+
+    assert.deepEqual(clickRow(step, 1), { handled: true });
+    const refolded = plain(chat.render(70)).filter(Boolean).join("\n");
+    assert.match(refolded, /▸ read · 1 thinking · 2\.0s\s{2}\(click or f2 to expand\)/);
+    assert.doesNotMatch(refolded, /first narration|file body/);
+
+    // The second stretch folds content out of a message that stays visible, so
+    // opening it leaves the paragraph alone and brings back only the reasoning.
+    assert.deepEqual(clickRow(second, 1), { handled: true });
+    const secondOpened = plain(chat.render(70)).join("\n");
+    assert.match(secondOpened, /▾ 1 thinking · 1\.0s\s{2}\(click to collapse\)/);
+    assert.match(secondOpened, /再看一遍/);
+    assert.match(secondOpened, /second answer/);
+    assert.doesNotMatch(secondOpened, /first narration|file body/, "the first stretch is still folded");
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("a summary row names the mouse only where the TUI routes it, and dispose puts the host back", () => {
+  const chat = new Container();
+  const step = assistantComponent(
+    assistant({ timestamp: T0, text: "narration", tools: [{ id: "a", name: "read" }], stopReason: "toolUse" }),
+  );
+  const tool = toolComponent("a", "read", "file body");
+  chat.addChild(step);
+  chat.addChild(tool);
+  chat.addChild(assistantComponent(assistant({ timestamp: T0 + 1_000, text: "answer" })));
+
+  const patch = installRunFoldPatch(DEFAULT_RUN_FOLD_OPTIONS);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setTimingSource(
+    timingsSource(
+      new Map([
+        [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+        [T0 + 1_000, { startedAt: T0 + 1_500, completedAt: T0 + 2_000 }],
+      ]),
+    ),
+  );
+  try {
+    // Regular mode hands the scrollback to the terminal, which never reports a
+    // click on it: the row keeps naming the key, and the host keeps Pi's handler.
+    const keyOnly = plain(chat.render(70)).filter(Boolean).join("\n");
+    assert.match(keyOnly, /▸ read · 2\.0s\s{2}\(f2 to expand\)/);
+    assert.equal(tool.handleMouse, ToolExecutionComponent.prototype.handleMouse);
+
+    patch.setClickToToggle(true);
+    patch.refresh();
+    const clickable = plain(chat.render(70)).filter(Boolean).join("\n");
+    assert.match(clickable, /▸ read · 2\.0s\s{2}\(click or f2 to expand\)/);
+    assert.notEqual(tool.handleMouse, ToolExecutionComponent.prototype.handleMouse);
+
+    // Every other row of a tool stays Pi's business: its own handler forwards
+    // clicks into the output it drew, and must not be swallowed by ours.
+    assert.equal(clickRow(tool, 3), undefined);
+    assert.match(
+      plain(chat.render(70)).filter(Boolean).join("\n"),
+      /▸ read · 2\.0s\s{2}\(click or f2 to expand\)/,
+    );
+  } finally {
+    patch.dispose();
+  }
+  assert.equal(tool.handleMouse, ToolExecutionComponent.prototype.handleMouse, "given back on dispose");
+});
+
+test("every other row of a host still reaches Pi's own mouse handlers", () => {
+  const chat = new Container();
+  // Folding the step's text keeps its reasoning on screen, where Pi wrapped it
+  // in a mouse region of its own - and the message is the stretch's host, so the
+  // summary row now sits above everything that region measures from.
+  const first = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "先看测试",
+      text: "first narration",
+      tools: [{ id: "a", name: "read" }],
+      stopReason: "toolUse",
+    }),
+  );
+  chat.addChild(first);
+  chat.addChild(toolComponent("a", "read", "file body"));
+  chat.addChild(assistantComponent(assistant({ timestamp: T0 + 1_000, text: "first answer" })));
+
+  const patch = installRunFoldPatch({
+    folded: true,
+    hideIntermediateText: true,
+    hideThinking: false,
+    hideToolCalls: false,
+  });
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setClickToToggle(true);
+  patch.setTimingSource(
+    timingsSource(
+      new Map([
+        [T0, { startedAt: T0, completedAt: T0 + 1_000 }],
+        [T0 + 1_000, { startedAt: T0 + 1_500, completedAt: T0 + 2_000 }],
+      ]),
+    ),
+  );
+  try {
+    const rows = plain(first.render(70));
+    assert.match(rows[1]!, /▸ 2\.0s\s{2}\(click or f2 to expand\)/, "the message hosts the summary");
+    const thinkingRow = rows.findIndex((line) => line.includes("先看测试"));
+    assert.ok(thinkingRow > 1, "the reasoning is under the summary block");
+
+    assert.equal(clickRow(first, thinkingRow)?.handled, true, "Pi's mouse region took the click");
+    const after = plain(first.render(70)).join("\n");
+    assert.doesNotMatch(after, /先看测试/, "Pi's own toggle closed the reasoning");
+    assert.match(after, /Thinking\.\.\./, "and drew its collapsed label");
+    assert.match(after, /▸ 2\.0s\s{2}\(click or f2 to expand\)/, "the stretch itself stayed folded");
+  } finally {
+    patch.dispose();
+  }
+});
+
 test("assertRunFoldPatch re-applies after another party restores the render", () => {
   const chat = new Container();
   const first = assistantComponent(assistant({ timestamp: T0, text: "narration", tools: [{ id: "t", name: "read" }], stopReason: "toolUse" }));
@@ -1001,10 +1191,14 @@ test("an aborted run expands again so its error output stays visible", async () 
   patch.setTheme(theme);
   patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0 }]])));
   try {
-    const live = plain(chat.render(70)).filter(Boolean);
+    const rows = plain(chat.render(70));
+    const live = rows.filter(Boolean);
     assert.match(live[0]!, /▸ 1 thinking · \d+s\s+\(f2 to expand\)/, "the finished step folds into the summary");
     assert.doesNotMatch(live.join("\n"), /先跑测试/, "the folded reasoning is gone");
-    assert.match(live.join("\n"), /\$/, "the running bash tool is the live tail");
+    // The fold takes whole rows or nothing: what is left of the running tool is
+    // exactly what Pi draws for it.
+    const runningRows = plain(running.render(70));
+    assert.deepEqual(rows.slice(-runningRows.length), runningRows, "the running bash tool is the live tail");
 
     // Pi marks the pending tool as an error during abort recovery.
     running.updateResult({ content: [{ type: "text", text: "Aborted after 1 retry attempt" }], isError: true });
@@ -1025,6 +1219,75 @@ test("an aborted run expands again so its error output stays visible", async () 
     assert.doesNotMatch(afterNextPrompt.join("\n"), /to expand/);
   } finally {
     patch.dispose();
+  }
+});
+
+test("the extension offers the mouse only where Pi routes it", async () => {
+  const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+  const pi = {
+    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+    },
+    registerShortcut() {},
+    registerCommand() {},
+  } as unknown as ExtensionAPI;
+
+  const root = new Container();
+  const chat = new Container();
+  root.addChild(chat);
+  const bridgeTui = root as unknown as TUI;
+  const setMode = (mode: "regular" | "fullscreen") => {
+    (bridgeTui as unknown as { mode: string }).mode = mode;
+  };
+  setMode("fullscreen");
+  (root as unknown as { requestRender: () => void }).requestRender = () => {};
+
+  let bridge: { render(width: number): string[] } | undefined;
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      theme,
+      setWidget(_key: string, factory: ((tui: TUI) => unknown) | undefined) {
+        bridge = factory?.(bridgeTui) as { render(width: number): string[] } | undefined;
+      },
+      setStatus() {},
+      notify() {},
+    },
+    sessionManager: { getEntries: () => [] },
+  } as unknown as ExtensionContext;
+  const emit = async (name: string, event: unknown = {}) => {
+    for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
+  };
+
+  runFoldExtension(pi);
+  try {
+    await emit("session_start");
+    // A run in flight: its finished step folds, the tool it is running stays.
+    const message = assistant({
+      timestamp: T0,
+      thinking: "先看测试",
+      text: "narration",
+      tools: [{ id: "a", name: "read" }],
+      stopReason: "toolUse",
+    });
+    await emit("message_start", { message });
+    const step = assistantComponent(message);
+    chat.addChild(step);
+    const tool = toolComponent("a", "read", "file body");
+    chat.addChild(tool);
+    bridge!.render(80); // the bridge frame that discovers the chat container
+
+    assert.match(plain(chat.render(80)).join("\n"), /▸ 1 thinking · 0s\s{2}\(click or f2 to expand\)/);
+    assert.notEqual(step.handleMouse, AssistantMessageComponent.prototype.handleMouse);
+
+    // Pi rebuilt its renderer without mouse input: the row stops offering it.
+    setMode("regular");
+    bridge!.render(80);
+    assert.match(plain(chat.render(80)).join("\n"), /▸ 1 thinking · 0s\s{2}\(f2 to expand\)/);
+    assert.equal(step.handleMouse, AssistantMessageComponent.prototype.handleMouse);
+  } finally {
+    await emit("session_shutdown", {});
   }
 });
 
@@ -1500,6 +1763,52 @@ class FakeTerminal implements Terminal {
   setTitle() {}
   setProgress() {}
 }
+
+test("a click in fullscreen lands on the summary row Pi's layout dispatch points at", () => {
+  const terminal = new FakeTerminal(80, 24);
+  const tui = new TuiAltScreen(terminal, false, "/tmp");
+  const chat = new Container();
+  const step = assistantComponent(
+    assistant({
+      timestamp: T0,
+      thinking: "先看测试",
+      text: "first narration",
+      tools: [{ id: "a", name: "read" }],
+      stopReason: "toolUse",
+    }),
+  );
+  chat.addChild(step);
+  chat.addChild(toolComponent("a", "read", "file body"));
+  chat.addChild(assistantComponent(assistant({ timestamp: T0 + 1_000, text: "first answer" })));
+  tui.addChild(chat);
+
+  const patch = installRunFoldPatch(options);
+  patch.setContainer(chat);
+  patch.setTheme(theme);
+  patch.setClickToToggle(true);
+  patch.setTimingSource(timingsSource(new Map([[T0, { startedAt: T0, completedAt: T0 + 1_000 }]])));
+  try {
+    tui.start();
+    tui.renderNow(true);
+    const painted = stripVTControlCharacters(terminal.writes.join(""));
+    assert.match(painted, /▸ read/, "the fold is painted");
+
+    // Fullscreen delivers the click through the containers Pi mounted, each
+    // taking its own rows off the top, so the row the pointer has to hit is the
+    // one the summary block puts it on: the second line, under its blank line.
+    terminal.writes = [];
+    const at = "\x1b[<0;3;2";
+    (tui as unknown as { handleViewportInput(data: string): unknown }).handleViewportInput(`${at}M`);
+    (tui as unknown as { handleViewportInput(data: string): unknown }).handleViewportInput(`${at}m`);
+    assert.match(plain(chat.render(80)).join("\n"), /▾ read · .*\(click to collapse\)/, "the click opened the stretch");
+
+    tui.renderNow(true);
+    assert.match(stripVTControlCharacters(terminal.writes.join("")), /first narration/, "what it hid is painted");
+  } finally {
+    patch.dispose();
+    tui.stop();
+  }
+});
 
 test("/run-fold redraw repaints offscreen runs through a scrollback preserver", async () => {
   const PRESERVE = Symbol.for("pi-preserve-scrollback.stdout-patch-state");
